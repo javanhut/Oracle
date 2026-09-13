@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.ravenoracle.Raven</id>
+  <name>Raven Oracle</name>
+  <summary>Find out what is wrong with this machine and what to try</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>A local troubleshooting companion. Oracle reads services, storage, network, packages, logs and hardware, says what looks wrong with the evidence it saw, and suggests commands you can copy. It never runs them.</p>
+    <p>With a model running on this machine, it also answers questions and explains errors you paste in. Nothing is sent anywhere else, and the exact text a model would see is shown before anything is sent.</p>
+    <p>It runs only while its window is open. There is no background service and no autostart.</p>
+  </description>
+  <launchable type="desktop-id">com.ravenoracle.Raven.desktop</launchable>
+  <provides>
+    <binary>raven-oracle</binary>
+    <binary>oracle</binary>
+  </provides>
+  <url type="homepage">https://github.com/javanhut/OracleAgent</url>
+</component>

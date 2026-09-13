@@ -1,0 +1,146 @@
+# ImLazy configuration for Oracle. Mirrors the Makefile; keep the two in step.
+#
+# `install` puts the `oracle` command, the `raven-oracle` app, its launcher
+# entry, metainfo and icon under /usr/local, like every other Raven app. Note
+# what is still absent: no target writes to /etc/raven, adds a service to
+# /etc/raven/init.d, drops a script in /etc/raven/session.d, or adds an
+# autostart entry. The app is in the launcher, and it runs when you open it.
+#
+# Packaging: `imlazy install destdir=/tmp/pkg` stages everything under that
+# root and leaves the desktop and icon caches alone, as `make install DESTDIR=`
+# does.
+
+[settings]
+default = "build"
+
+[variables]
+app_id = "com.ravenoracle.Raven"
+prefix = "/usr/local"
+destdir = ""
+bindir = "{{destdir}}{{prefix}}/bin"
+datadir = "{{destdir}}{{prefix}}/share"
+icondir = "{{datadir}}/icons/hicolor/scalable/apps"
+cli = "oracle"
+gui = "raven-oracle"
+target = "target/release"
+snapshot_dir = "target/snapshots"
+
+[commands]
+
+[commands.build]
+desc = "Build the command line and the desktop app"
+alias = ["b"]
+watch = ["src/**/*.rs", "data/**", "Cargo.toml"]
+run = ["cargo build --release --locked"]
+
+[commands.build-cli]
+desc = "Build only the command line and terminal interface, without GTK"
+run = ["cargo build --release --locked --no-default-features --features tui --bin {{cli}}"]
+
+[commands.build-minimal]
+desc = "Build the checks alone, with neither interface"
+run = ["cargo build --release --locked --no-default-features"]
+
+[commands.test]
+desc = "Run the test suite, with and without the interfaces"
+alias = ["t"]
+watch = ["src/**/*.rs", "data/**", "Cargo.toml", "lazy.toml", "Makefile"]
+run = [
+  "cargo test --locked --all-targets",
+  "cargo test --locked --no-default-features --all-targets",
+]
+
+[commands.check]
+desc = "Formatting, Clippy and the full locked test suite, both feature sets"
+watch = ["src/**/*.rs", "data/**", "Cargo.toml", "lazy.toml", "Makefile"]
+run = [
+  "cargo fmt --check",
+  "cargo clippy --locked --all-targets -- -D warnings",
+  "cargo clippy --locked --no-default-features --all-targets -- -D warnings",
+  "cargo test --locked --all-targets",
+  "cargo test --locked --no-default-features --all-targets",
+]
+
+[commands.format]
+desc = "Format the code"
+alias = ["fmt", "f"]
+run = ["cargo fmt --all"]
+
+[commands.run]
+desc = "Build and run `oracle doctor` against this machine"
+alias = ["r"]
+run = ["cargo run --quiet --bin {{cli}} -- doctor"]
+
+[commands.gui]
+desc = "Build and open the desktop app (with -w, relaunches on every change)"
+alias = ["g"]
+watch = ["src/**/*.rs", "data/**"]
+restart = true
+run = ["cargo run --quiet --bin {{gui}}"]
+
+[commands.tui]
+desc = "Build and open the terminal interface"
+run = ["cargo run --quiet --bin {{cli}} -- tui"]
+
+[commands.snapshot]
+desc = "Render every page of the desktop app to a PNG in target/snapshots"
+run = [
+  "rm -rf {{snapshot_dir}}",
+  "RAVEN_ORACLE_SNAPSHOT={{snapshot_dir}} cargo run --quiet --bin {{gui}}",
+  "ls {{snapshot_dir}}",
+]
+
+[commands.smoke]
+desc = "Drive the terminal interface in a real pty and check what it draws"
+dep = ["build"]
+run = ["python3 scripts/tui-smoke.py {{target}}/{{cli}}"]
+
+[commands.install]
+desc = "Install Oracle and its desktop entry to /usr/local"
+dep = ["build"]
+escalate = true
+writes = ["{{bindir}}", "{{datadir}}/applications", "{{datadir}}/metainfo", "{{icondir}}"]
+run = [
+  "install -Dm755 {{target}}/{{cli}} {{bindir}}/{{cli}}",
+  "install -Dm755 {{target}}/{{gui}} {{bindir}}/{{gui}}",
+  "install -Dm644 data/{{app_id}}.desktop {{datadir}}/applications/{{app_id}}.desktop",
+  "install -Dm644 data/{{app_id}}.metainfo.xml {{datadir}}/metainfo/{{app_id}}.metainfo.xml",
+  "install -Dm644 data/icons/hicolor/scalable/apps/{{app_id}}.svg {{icondir}}/{{app_id}}.svg",
+  # Refreshing the caches is what makes the entry show up in launchers; a
+  # staged install leaves that to the packager.
+  "sh -c '[ -n \"{{destdir}}\" ] || ! command -v update-desktop-database >/dev/null 2>&1 || update-desktop-database -q {{datadir}}/applications'",
+  "sh -c '[ -n \"{{destdir}}\" ] || ! command -v gtk-update-icon-cache >/dev/null 2>&1 || gtk-update-icon-cache -qtf {{datadir}}/icons/hicolor'",
+  "echo \"Installed Raven Oracle to {{destdir}}{{prefix}}.\"",
+  "echo \"Nothing was enabled, autostarted, or added to /etc/raven.\"",
+  "echo \"Open it from the launcher, or run: oracle doctor\"",
+]
+
+[commands.install-cli]
+desc = "Install only the `oracle` command. Installs nothing else."
+dep = ["build-cli"]
+escalate = true
+writes = ["{{bindir}}"]
+run = [
+  "install -Dm755 {{target}}/{{cli}} {{bindir}}/{{cli}}",
+  "echo \"Installed {{cli}} to {{bindir}}. Nothing else was installed.\"",
+]
+
+[commands.uninstall]
+desc = "Remove Oracle. Leaves your config; `oracle forget` deletes that."
+escalate = true
+writes = ["{{bindir}}", "{{datadir}}/applications", "{{datadir}}/metainfo", "{{icondir}}"]
+run = [
+  "rm -f {{bindir}}/{{cli}}",
+  "rm -f {{bindir}}/{{gui}}",
+  "rm -f {{datadir}}/applications/{{app_id}}.desktop",
+  "rm -f {{datadir}}/metainfo/{{app_id}}.metainfo.xml",
+  "rm -f {{icondir}}/{{app_id}}.svg",
+  "sh -c '[ -n \"{{destdir}}\" ] || ! command -v update-desktop-database >/dev/null 2>&1 || update-desktop-database -q {{datadir}}/applications'",
+  "sh -c '[ -n \"{{destdir}}\" ] || ! command -v gtk-update-icon-cache >/dev/null 2>&1 || gtk-update-icon-cache -qtf {{datadir}}/icons/hicolor'",
+  "echo \"Removed Raven Oracle. Your config and any whisper models are untouched.\"",
+  "echo \"Run 'oracle forget' before uninstalling to delete those too.\"",
+]
+
+[commands.clean]
+desc = "Remove build artifacts"
+run = ["cargo clean"]

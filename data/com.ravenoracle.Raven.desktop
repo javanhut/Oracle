@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Raven Oracle
+GenericName=Troubleshooting
+Comment=Find out what is wrong with this machine and what to try
+Exec=raven-oracle
+Icon=com.ravenoracle.Raven
+Terminal=false
+Type=Application
+Categories=System;Monitor;GTK;
+Keywords=Troubleshoot;Diagnose;Doctor;Problem;Error;Help;Oracle;Logs;Services;
+StartupNotify=true
+StartupWMClass=raven-oracle
