@@ -86,11 +86,24 @@ impl ModelState {
                         .unwrap_or_else(|| format!("Nothing is answering at {}.", a.endpoint))
                 } else if let Some(m) = &a.selected {
                     format!("{m} on {backend} at {}", a.endpoint)
-                } else {
+                } else if a.models.is_empty() {
                     format!(
-                        "{backend} is running at {} but has no model to answer with.",
+                        "{backend} is running at {} but has no models installed.",
                         a.endpoint
                     )
+                } else {
+                    // Up, with models, but not the one that was named. Say
+                    // which it has: the usual cause is a tag that does not
+                    // exist, like `:latest` for a model pulled as `:9b`.
+                    const SHOWN: usize = 8;
+                    let mut names = a.models.iter().take(SHOWN).cloned().collect::<Vec<_>>();
+                    if a.models.len() > SHOWN {
+                        names.push(format!("and {} more", a.models.len() - SHOWN));
+                    }
+                    let why = a.detail.clone().unwrap_or_else(|| {
+                        "The model named in Settings is not on this server.".into()
+                    });
+                    format!("{why} It has: {}.", names.join(", "))
                 }
             }
             ModelState::Off(e) => e.clone(),
@@ -459,10 +472,25 @@ mod tests {
     }
 
     #[test]
-    fn an_https_address_is_explained_rather_than_tried() {
+    fn https_is_accepted_but_does_not_make_a_remote_server_local() {
         let mut cfg = Config::default();
         cfg.model.endpoint = "https://127.0.0.1:11434".into();
-        assert!(endpoint_problem(&cfg).unwrap().contains("https"));
+        assert_eq!(
+            endpoint_problem(&cfg),
+            None,
+            "https on this machine is fine"
+        );
+
+        cfg.model.endpoint = "https://192.168.1.50".into();
+        let problem = endpoint_problem(&cfg).expect("off-machine https must still be refused");
+        assert!(
+            problem.contains("https://192.168.1.50:443"),
+            "got {problem}"
+        );
+        assert!(
+            problem.contains("Allow a model on another machine"),
+            "got {problem}"
+        );
     }
 
     #[test]
@@ -473,6 +501,45 @@ mod tests {
         assert!(!model_settings_differ(&saved, &form));
         form.model.endpoint = "http://127.0.0.1:8080".into();
         assert!(model_settings_differ(&saved, &form));
+    }
+
+    #[test]
+    fn a_named_model_the_server_lacks_is_explained_with_what_it_has() {
+        // The real case: `ornith-1.5:latest` asked for, `:35B` and `:9b` present.
+        let state = ModelState::Checked {
+            backend: "ollama",
+            availability: Availability {
+                reachable: true,
+                endpoint: "https://gpt.example.com:443".into(),
+                models: vec!["ornith-1.5:35B".into(), "ornith-1.5:9b".into()],
+                selected: None,
+                detail: Some(
+                    "The configured model \"ornith-1.5:latest\" is not installed on this server."
+                        .into(),
+                ),
+            },
+        };
+        let text = state.describe();
+        assert!(text.contains("ornith-1.5:latest"), "got {text}");
+        assert!(text.contains("ornith-1.5:35B, ornith-1.5:9b"), "got {text}");
+        assert!(!text.contains("has no model"), "got {text}");
+    }
+
+    #[test]
+    fn a_long_model_list_is_cut_short_and_counted() {
+        let state = ModelState::Checked {
+            backend: "ollama",
+            availability: Availability {
+                reachable: true,
+                endpoint: "http://127.0.0.1:11434".into(),
+                models: (0..11).map(|i| format!("m{i}")).collect(),
+                selected: None,
+                detail: None,
+            },
+        };
+        let text = state.describe();
+        assert!(text.contains("m7, and 3 more"), "got {text}");
+        assert!(!text.contains("m8"), "got {text}");
     }
 
     #[test]

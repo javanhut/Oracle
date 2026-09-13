@@ -13,7 +13,7 @@ use libadwaita::prelude::*;
 use oracle::config::{self, Config};
 use oracle::probe::Area;
 
-use crate::ui::state::{self, BACKENDS};
+use crate::ui::state::{self, BACKENDS, ModelState};
 use crate::ui::{App, alert, confirm, widgets};
 
 /// The controls, so they can be filled from a config and read back into one.
@@ -81,6 +81,29 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     let name = adw::EntryRow::builder()
         .title("Model (empty picks a small instruction-tuned one)")
         .build();
+    // After Check, the server's own model names, so one does not have to be
+    // typed exactly -- tag and all -- to be found.
+    let models_list = gtk::ListBox::new();
+    models_list.set_selection_mode(gtk::SelectionMode::None);
+    let models_popover = gtk::Popover::builder()
+        .child(
+            &gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .max_content_height(320)
+                .propagate_natural_height(true)
+                .child(&models_list)
+                .build(),
+        )
+        .build();
+    let pick_model = gtk::MenuButton::builder()
+        .icon_name("pan-down-symbolic")
+        .tooltip_text("Choose one of the models this server has")
+        .valign(gtk::Align::Center)
+        .popover(&models_popover)
+        .visible(false)
+        .build();
+    pick_model.add_css_class("flat");
+    name.add_suffix(&pick_model);
     model_list.append(&name);
     let connection = widgets::fact_row("Saved server");
     let check = gtk::Button::with_label("Check");
@@ -167,10 +190,38 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
             tested.set_text(&format!("Trying {}…", candidate.model.endpoint));
             let check = check.clone();
             let tested = tested.clone();
+            let pick_model = pick_model.clone();
+            let models_list = models_list.clone();
+            let models_popover = models_popover.clone();
+            let name_entry = form.name.clone();
             crate::ui::spawn(
                 move || crate::ui::probe_model(&candidate),
                 move |result| {
                     check.set_sensitive(true);
+
+                    while let Some(child) = models_list.first_child() {
+                        models_list.remove(&child);
+                    }
+                    let models = match &result {
+                        ModelState::Checked { availability, .. } => availability.models.clone(),
+                        _ => Vec::new(),
+                    };
+                    pick_model.set_visible(!models.is_empty());
+                    for model in models {
+                        let choice = gtk::Button::with_label(&model);
+                        choice.add_css_class("flat");
+                        if let Some(label) = choice.child() {
+                            label.set_halign(gtk::Align::Start);
+                        }
+                        let name_entry = name_entry.clone();
+                        let models_popover = models_popover.clone();
+                        choice.connect_clicked(move |_| {
+                            name_entry.set_text(&model);
+                            models_popover.popdown();
+                        });
+                        models_list.append(&choice);
+                    }
+
                     let mut text = if result.ready() {
                         tested.add_css_class("success");
                         format!("Connected: {}.", result.describe())

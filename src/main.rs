@@ -30,9 +30,9 @@
 //!    Every probe is a read.
 //! 3. **It is useful without a model.** The rules in `diagnose` find real
 //!    problems with no inference server, no weights and no network.
-//! 4. **Nothing leaves the machine.** The HTTP client cannot do TLS and the
-//!    config refuses a non-loopback endpoint. `oracle context` shows exactly
-//!    what would be sent, before anything is.
+//! 4. **Nothing leaves the machine unless you say so.** The config refuses a
+//!    non-loopback endpoint until it is permitted, http or https alike.
+//!    `oracle context` shows exactly what would be sent, before anything is.
 //! 5. **It does not nag.** No first-run wizard, no upsell at the end of
 //!    commands, no telling you twice about the same missing piece.
 

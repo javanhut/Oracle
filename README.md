@@ -153,7 +153,7 @@ command that does the same job.
 |---|---|
 | Run in the background | There is no daemon, no timer, and no autostart. There is no code here that could add one. |
 | Change your system | Every probe is a read. It prints commands; you decide. |
-| Send anything anywhere | The HTTP client cannot do TLS, and a non-loopback endpoint is refused unless you deliberately permit it. |
+| Send anything anywhere | A model endpoint off this machine is refused unless you deliberately permit it, http or https alike. |
 | Install things for you | It will tell you what is missing, once, and stop. |
 | Nag | No first-run wizard, no prompts at the end of other commands, no telling you twice. |
 
@@ -282,10 +282,16 @@ nothing about where you are. The one exception is an IPv6 address whose second
 half was built from the MAC (EUI-64): that half is masked on any address,
 link-local included, because it is the MAC.
 
-The model endpoint must be on this machine. The transport has no TLS support at
-all, so it cannot reach an `https://` service, and `Config::endpoint` refuses a
-non-loopback address unless `allow_remote_endpoint` is deliberately set. Local is
+The model endpoint must be on this machine unless you say otherwise.
+`Config::endpoint` refuses a non-loopback address until `allow_remote_endpoint`
+is deliberately set (in the app, *Allow a model on another machine*). Local is
 enforced by the code rather than promised by this file.
+
+`https://` endpoints work, for a server behind a TLS proxy or on another
+machine. The connection goes through rustls and is verified against the
+system's trusted certificates, and there is no option to skip verification.
+HTTPS changes how the bytes travel, not where Oracle may send them: an
+`https://` address off this machine is refused exactly as an `http://` one is.
 
 Nothing is logged. History is off by default, so Oracle does not accumulate a
 record of your problems unless you ask it to.
@@ -348,14 +354,15 @@ imlazy smoke            # drive the terminal interface in a real pty
 
 The checks, rules, model client and prompts are a library (`src/lib.rs`) that
 both front ends use, so a finding reads the same wherever it is reported.
-Three dependencies for the checks themselves: `serde`, `serde_json` and `toml`,
-all pure Rust. The terminal interface adds `ratatui`, and the desktop app adds
+The core has five dependencies: `serde`, `serde_json` and `toml` for the
+checks, and `rustls` with `rustls-native-certs` for https to a model server. The terminal interface adds `ratatui`, and the desktop app adds
 the gtk-rs crates at the same versions as the other Raven apps; either can be
 compiled out. The desktop app's state and decisions live in a GTK-free module
 with its own tests, the same split the terminal interface makes.
 The HTTP client is a few hundred lines here rather than a crate, which keeps the
-tree small, keeps TLS out of the binary on purpose, and follows what the rest of
-the Raven layer already does.
+tree small and follows what the rest of the Raven layer already does. HTTPS is
+rustls with the ring backend and the system's certificate store, so there is no
+OpenSSL in the binary.
 
 The interface is tested without a terminal and then with one. Its state machine
 is a plain type with no drawing in it, frames are rendered to ratatui's test

@@ -8,10 +8,11 @@
 //! explains in one short paragraph what it would need and stops. It does not
 //! offer to install anything on your behalf.
 //!
-//! The second is that the endpoint is on this machine. The transport in
-//! `http` cannot do TLS, and `Config::endpoint` refuses a non-loopback address
-//! unless it has been explicitly permitted, so "local" is enforced by the code
-//! rather than promised by the documentation.
+//! The second is that the endpoint is on this machine. `Config::endpoint`
+//! refuses a non-loopback address unless it has been explicitly permitted --
+//! whether it is http or https, since TLS changes how the bytes travel and not
+//! where they may go -- so "local" is enforced by the code rather than
+//! promised by the documentation.
 
 pub mod llamacpp;
 pub mod ollama;

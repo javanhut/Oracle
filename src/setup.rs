@@ -243,10 +243,11 @@ fn choose_privacy(cfg: &mut Config) {
 /// Download a whisper model, on an explicit request, with the size stated
 /// first.
 ///
-/// `curl` does the transfer rather than a built-in HTTP client, for two
-/// reasons: Oracle's own client cannot do TLS on purpose, and using the
-/// system's downloader keeps the user's proxy settings, certificates and
-/// bandwidth limits in play.
+/// `curl` does the transfer rather than Oracle's own client, for two
+/// reasons: that client is for talking to a model server, under the endpoint
+/// policy, not for fetching files from the internet; and using the system's
+/// downloader keeps the user's proxy settings, certificates and bandwidth
+/// limits in play.
 pub fn fetch_whisper_model(name: &str, assume_yes: bool) -> i32 {
     let Some(model) = WHISPER_MODELS.iter().find(|m| m.name == name) else {
         ui::error(&format!("unknown model {name:?}"));
