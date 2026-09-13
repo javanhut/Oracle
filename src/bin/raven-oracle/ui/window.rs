@@ -215,10 +215,12 @@ fn nav_row(info: &PageInfo) -> gtk::ListBoxRow {
     tile.add_css_class(info.tint);
     tile.set_halign(gtk::Align::Center);
     tile.set_valign(gtk::Align::Center);
-    // The tile must not expand: an expanding child would widen it and push
+    // The icon fills the tile so it can sit in its centre. Setting the tile's
+    // own hexpand explicitly stops that expansion propagating up and pushing
     // the label into the middle of the row.
     tile.set_hexpand(false);
     let icon = gtk::Image::from_icon_name(info.icon);
+    icon.set_hexpand(true);
     icon.set_halign(gtk::Align::Center);
     icon.set_valign(gtk::Align::Center);
     tile.append(&icon);

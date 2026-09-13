@@ -61,14 +61,19 @@ impl Ollama {
     /// people do without connecting it to this tool.
     fn choose(&self, available: &[String]) -> Option<String> {
         if !self.model.is_empty() {
-            // Ollama names carry a tag; `qwen2.5` should match `qwen2.5:7b`.
-            if let Some(exact) = available.iter().find(|m| *m == &self.model) {
+            // Ollama compares names without regard to case, so `:35b` names
+            // the model the server lists as `:35B`. The server's own spelling
+            // is what gets sent.
+            let wanted = self.model.trim();
+            if let Some(exact) = available.iter().find(|m| m.eq_ignore_ascii_case(wanted)) {
                 return Some(exact.clone());
             }
-            if let Some(prefix) = available
-                .iter()
-                .find(|m| m.split(':').next() == Some(self.model.as_str()))
-            {
+            // Ollama names carry a tag; `qwen2.5` should match `qwen2.5:7b`.
+            if let Some(prefix) = available.iter().find(|m| {
+                m.split(':')
+                    .next()
+                    .is_some_and(|base| base.eq_ignore_ascii_case(wanted))
+            }) {
                 return Some(prefix.clone());
             }
             // Configured but absent: say so rather than quietly using another.
@@ -266,6 +271,23 @@ mod tests {
         let o = ollama("llama3.2:3b");
         let have = vec!["llama3.2:3b".to_string(), "llama3.2:1b".to_string()];
         assert_eq!(o.choose(&have).as_deref(), Some("llama3.2:3b"));
+    }
+
+    #[test]
+    fn a_name_is_matched_regardless_of_case_and_sent_as_the_server_spells_it() {
+        let o = ollama("ornith-1.5:35b");
+        let have = vec!["ornith-1.5:35B".to_string(), "ornith-1.5:9b".to_string()];
+        assert_eq!(o.choose(&have).as_deref(), Some("ornith-1.5:35B"));
+        assert_eq!(
+            ollama("ORNITH-1.5").choose(&have).as_deref(),
+            Some("ornith-1.5:35B")
+        );
+    }
+
+    #[test]
+    fn a_tag_that_does_not_exist_is_still_absent_whatever_its_case() {
+        let have = vec!["ornith-1.5:35B".to_string(), "ornith-1.5:9b".to_string()];
+        assert_eq!(ollama("ornith-1.5:latest").choose(&have), None);
     }
 
     #[test]

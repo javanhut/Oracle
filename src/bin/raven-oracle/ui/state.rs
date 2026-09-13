@@ -328,6 +328,30 @@ pub fn model_settings_differ(a: &Config, b: &Config) -> bool {
         || a.privacy.allow_remote_endpoint != b.privacy.allow_remote_endpoint
 }
 
+/// The entries of the Model dropdown: automatic first (the empty name), then
+/// every model the server listed, then the saved name if the server did not
+/// list it -- so opening Settings while the server is down never silently
+/// throws away what was saved.
+pub fn model_choices(server: &[String], keep: &str) -> Vec<String> {
+    let mut choices = vec![String::new()];
+    choices.extend(server.iter().cloned());
+    let keep = keep.trim();
+    if !keep.is_empty() && !server.iter().any(|m| m.eq_ignore_ascii_case(keep)) {
+        choices.push(keep.to_string());
+    }
+    choices
+}
+
+/// Which entry of [`model_choices`] a name selects. Case is ignored, as
+/// Ollama ignores it, so a saved `:35b` lands on the server's `:35B`.
+pub fn choice_index(choices: &[String], name: &str) -> u32 {
+    let name = name.trim();
+    choices
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name))
+        .unwrap_or(0) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +525,39 @@ mod tests {
         assert!(!model_settings_differ(&saved, &form));
         form.model.endpoint = "http://127.0.0.1:8080".into();
         assert!(model_settings_differ(&saved, &form));
+    }
+
+    #[test]
+    fn the_model_dropdown_offers_automatic_then_the_servers_models() {
+        let server = vec!["ornith-1.5:35B".to_string(), "ornith-1.5:9b".to_string()];
+        let choices = model_choices(&server, "");
+        assert_eq!(choices, vec!["", "ornith-1.5:35B", "ornith-1.5:9b"]);
+        assert_eq!(choice_index(&choices, ""), 0);
+    }
+
+    #[test]
+    fn a_saved_model_is_selected_whatever_its_case_and_not_listed_twice() {
+        let server = vec!["ornith-1.5:35B".to_string(), "ornith-1.5:9b".to_string()];
+        let choices = model_choices(&server, "ornith-1.5:35b");
+        assert_eq!(choices.len(), 3, "no duplicate entry for a case difference");
+        assert_eq!(
+            choices[choice_index(&choices, "ornith-1.5:35b") as usize],
+            "ornith-1.5:35B"
+        );
+    }
+
+    #[test]
+    fn a_saved_model_survives_a_server_that_is_down_or_lacks_it() {
+        let choices = model_choices(&[], "ornith-1.5:latest");
+        assert_eq!(choices, vec!["", "ornith-1.5:latest"]);
+        assert_eq!(choice_index(&choices, "ornith-1.5:latest"), 1);
+
+        let server = vec!["ornith-1.5:9b".to_string()];
+        let choices = model_choices(&server, "ornith-1.5:latest");
+        assert_eq!(
+            choices.last().map(String::as_str),
+            Some("ornith-1.5:latest")
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! -- the same file `oracle setup` writes, so the two front ends never
 //! disagree about how Oracle is configured.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4 as gtk;
@@ -16,11 +17,17 @@ use oracle::probe::Area;
 use crate::ui::state::{self, BACKENDS, ModelState};
 use crate::ui::{App, alert, confirm, widgets};
 
+const AUTOMATIC: &str = "Automatic: a small instruction-tuned model";
+
 /// The controls, so they can be filled from a config and read back into one.
 struct Form {
     backend: adw::ComboRow,
     endpoint: adw::EntryRow,
-    name: adw::EntryRow,
+    model: adw::ComboRow,
+    /// The models the server last listed, empty until something asked it.
+    known: RefCell<Vec<String>>,
+    /// What each entry of `model` stands for; the first is automatic (`""`).
+    choices: RefCell<Vec<String>>,
     areas: Vec<(Area, adw::SwitchRow)>,
     redact: adw::SwitchRow,
     remote: adw::SwitchRow,
@@ -31,7 +38,8 @@ impl Form {
         self.backend
             .set_selected(state::backend_index(&cfg.model.backend));
         self.endpoint.set_text(&cfg.model.endpoint);
-        self.name.set_text(&cfg.model.name);
+        let known = self.known.borrow().clone();
+        self.set_models(&known, &cfg.model.name);
         for (area, row) in &self.areas {
             row.set_active(state::area_enabled(cfg, *area));
         }
@@ -46,13 +54,63 @@ impl Form {
         let (backend, _) = BACKENDS[(self.backend.selected() as usize).min(BACKENDS.len() - 1)];
         cfg.model.backend = backend.to_string();
         cfg.model.endpoint = state::normalise_endpoint(&self.endpoint.text());
-        cfg.model.name = self.name.text().trim().to_string();
+        cfg.model.name = self.selected_model();
         for (area, row) in &self.areas {
             state::set_area(&mut cfg, *area, row.is_active());
         }
         cfg.privacy.redact = self.redact.is_active();
         cfg.privacy.allow_remote_endpoint = self.remote.is_active();
         cfg
+    }
+
+    /// Fill the Model dropdown from what the server listed, selecting `keep`.
+    fn set_models(&self, server: &[String], keep: &str) {
+        let choices = state::model_choices(server, keep);
+        let selected = state::choice_index(&choices, keep);
+        if *self.choices.borrow() != choices {
+            let labels: Vec<String> = choices
+                .iter()
+                .map(|c| {
+                    if c.is_empty() {
+                        AUTOMATIC.to_string()
+                    } else if !server.is_empty() && !server.contains(c) {
+                        format!("{c} (not on this server)")
+                    } else {
+                        c.clone()
+                    }
+                })
+                .collect();
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+            *self.choices.borrow_mut() = choices;
+            if let Some(list) = self.model.model().and_downcast::<gtk::StringList>() {
+                list.splice(0, list.n_items(), &labels);
+            }
+        }
+        self.model.set_selected(selected);
+        *self.known.borrow_mut() = server.to_vec();
+        self.model.set_subtitle(if server.is_empty() {
+            "Press Check to list the models on this server"
+        } else {
+            ""
+        });
+    }
+
+    fn selected_model(&self) -> String {
+        self.choices
+            .borrow()
+            .get(self.model.selected() as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The models a check found, or none when it did not reach a server.
+fn listed_models(result: &ModelState) -> Vec<String> {
+    match result {
+        ModelState::Checked { availability, .. } if availability.reachable => {
+            availability.models.clone()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -78,38 +136,25 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     model_list.append(&backend);
     let endpoint = adw::EntryRow::builder().title("Address").build();
     model_list.append(&endpoint);
-    let name = adw::EntryRow::builder()
-        .title("Model (empty picks a small instruction-tuned one)")
+    // A dropdown of the server's own model names, so none has to be typed
+    // exactly -- tag, case and all -- to be found. Searchable, because a
+    // server can carry dozens.
+    let model = adw::ComboRow::builder()
+        .title("Model")
+        .model(&gtk::StringList::new(&[]))
+        .enable_search(true)
+        .expression(gtk::PropertyExpression::new(
+            gtk::StringObject::static_type(),
+            None::<&gtk::Expression>,
+            "string",
+        ))
         .build();
-    // After Check, the server's own model names, so one does not have to be
-    // typed exactly -- tag and all -- to be found.
-    let models_list = gtk::ListBox::new();
-    models_list.set_selection_mode(gtk::SelectionMode::None);
-    let models_popover = gtk::Popover::builder()
-        .child(
-            &gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .max_content_height(320)
-                .propagate_natural_height(true)
-                .child(&models_list)
-                .build(),
-        )
-        .build();
-    let pick_model = gtk::MenuButton::builder()
-        .icon_name("pan-down-symbolic")
-        .tooltip_text("Choose one of the models this server has")
-        .valign(gtk::Align::Center)
-        .popover(&models_popover)
-        .visible(false)
-        .build();
-    pick_model.add_css_class("flat");
-    name.add_suffix(&pick_model);
-    model_list.append(&name);
+    model_list.append(&model);
     let connection = widgets::fact_row("Saved server");
     let check = gtk::Button::with_label("Check");
     check.set_valign(gtk::Align::Center);
     check.set_tooltip_text(Some(
-        "Try the server and address above, whether or not they are saved",
+        "Try the server and address above, whether or not they are saved, and list its models",
     ));
     connection.add_suffix(&check);
     model_list.append(&connection);
@@ -165,7 +210,9 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     let form = Rc::new(Form {
         backend,
         endpoint,
-        name,
+        model,
+        known: RefCell::new(Vec::new()),
+        choices: RefCell::new(Vec::new()),
         areas,
         redact,
         remote,
@@ -190,37 +237,15 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
             tested.set_text(&format!("Trying {}…", candidate.model.endpoint));
             let check = check.clone();
             let tested = tested.clone();
-            let pick_model = pick_model.clone();
-            let models_list = models_list.clone();
-            let models_popover = models_popover.clone();
-            let name_entry = form.name.clone();
+            let form = form.clone();
             crate::ui::spawn(
                 move || crate::ui::probe_model(&candidate),
                 move |result| {
                     check.set_sensitive(true);
-
-                    while let Some(child) = models_list.first_child() {
-                        models_list.remove(&child);
-                    }
-                    let models = match &result {
-                        ModelState::Checked { availability, .. } => availability.models.clone(),
-                        _ => Vec::new(),
-                    };
-                    pick_model.set_visible(!models.is_empty());
-                    for model in models {
-                        let choice = gtk::Button::with_label(&model);
-                        choice.add_css_class("flat");
-                        if let Some(label) = choice.child() {
-                            label.set_halign(gtk::Align::Start);
-                        }
-                        let name_entry = name_entry.clone();
-                        let models_popover = models_popover.clone();
-                        choice.connect_clicked(move |_| {
-                            name_entry.set_text(&model);
-                            models_popover.popdown();
-                        });
-                        models_list.append(&choice);
-                    }
+                    // Keep whatever is selected now; the list may have grown
+                    // around it.
+                    let keep = form.selected_model();
+                    form.set_models(&listed_models(&result), &keep);
 
                     let mut text = if result.ready() {
                         tested.add_css_class("success");
@@ -355,6 +380,17 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
         } else {
             "Not written. Oracle is using its defaults".to_string()
         }));
+
+        // When the saved server answers with its models and the form is still
+        // showing that server, offer them without waiting for Check.
+        let listed = listed_models(&st.model);
+        let shown = form.read(&st.config);
+        let showing_saved_server = shown.model.backend == st.config.model.backend
+            && shown.model.endpoint == st.config.model.endpoint;
+        if !listed.is_empty() && showing_saved_server && *form.known.borrow() != listed {
+            let keep = form.selected_model();
+            form.set_models(&listed, &keep);
+        }
     };
     refresh(app);
     app.on_change(refresh);
