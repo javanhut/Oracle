@@ -116,6 +116,68 @@ pub trait Backend {
     ) -> Result<String, ModelError>;
 }
 
+/// How a streamed reply ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ending {
+    /// The server said it was done, of its own accord.
+    Complete,
+    /// The server stopped because the reply reached the token limit.
+    Limit,
+    /// The stream closed without the server saying it was done.
+    Cut,
+}
+
+/// Turn what a stream produced into the call's result.
+///
+/// A reply with no answer in it is a failure however the stream ended: an
+/// empty answer reported as a success is the one outcome nobody can act on.
+/// An answer that stopped short is kept, with a line saying so, because half
+/// an answer is worth reading once you know it is half.
+///
+/// `thought` is whether the model sent reasoning before (or instead of) an
+/// answer, which is the usual reason a limit is reached with nothing to show.
+pub(crate) fn settle(
+    mut full: String,
+    ending: Ending,
+    thought: bool,
+    max_tokens: u32,
+    on_token: &mut dyn FnMut(&str) -> bool,
+) -> Result<String, ModelError> {
+    if full.trim().is_empty() {
+        return Err(ModelError::Failed(match (ending, thought) {
+            (Ending::Limit, true) => format!(
+                "the model spent its whole allowance of {max_tokens} tokens thinking and never \
+                 started the answer. Raise max_tokens under [model] in {}, or use a model that \
+                 does not think before answering.",
+                crate::config::tilde(&Config::path())
+            ),
+            (Ending::Limit, false) => format!(
+                "the model reached its limit of {max_tokens} tokens without writing an answer. \
+                 Raise max_tokens under [model] in {}.",
+                crate::config::tilde(&Config::path())
+            ),
+            (Ending::Complete, _) => "the model finished without writing an answer.".into(),
+            (Ending::Cut, _) => {
+                "the connection to the model server closed before any answer arrived.".into()
+            }
+        }));
+    }
+    let note = match ending {
+        Ending::Complete => return Ok(full),
+        Ending::Limit => format!(
+            "\n\n[Cut off: the answer reached the limit of {max_tokens} tokens. Raise max_tokens \
+             under [model] in {} for longer answers.]",
+            crate::config::tilde(&Config::path())
+        ),
+        Ending::Cut => "\n\n[Cut off: the connection closed before the answer finished.]".into(),
+    };
+    // The note is the last thing sent, so a sink that wants to stop now has
+    // nothing further to refuse.
+    let _ = on_token(&note);
+    full.push_str(&note);
+    Ok(full)
+}
+
 /// Build the backend named in the config.
 ///
 /// `none` is a real, supported choice rather than a broken state: it means
@@ -169,9 +231,11 @@ pub fn no_model_advice(cfg: &Config) -> String {
 pub mod testserver {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     pub struct Server {
         pub port: u16,
+        bodies: Arc<Mutex<Vec<String>>>,
     }
 
     impl Server {
@@ -188,6 +252,8 @@ pub mod testserver {
             listener
                 .set_nonblocking(true)
                 .expect("a non-blocking listener");
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let recorded = bodies.clone();
 
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -226,16 +292,27 @@ pub mod testserver {
                             length = v.trim().parse().unwrap_or(0);
                         }
                     }
+                    let mut body = vec![0u8; length];
                     if length > 0 {
-                        let mut body = vec![0u8; length];
                         let _ = reader.read_exact(&mut body);
                     }
+                    // Recorded before replying, so a client that has its
+                    // answer can rely on its request being here.
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body).into_owned());
                     let _ = stream.write_all(&response);
                     let _ = stream.flush();
                 }
             });
 
-            Server { port }
+            Server { port, bodies }
+        }
+
+        /// The request bodies received so far, in order.
+        pub fn bodies(&self) -> Vec<String> {
+            self.bodies.lock().unwrap().clone()
         }
 
         pub fn url(&self) -> crate::http::Url {

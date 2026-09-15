@@ -38,7 +38,7 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     body.append(&buttons);
     content.append(&card);
 
-    let conversation = Conversation::new(app);
+    let conversation = Conversation::new(app, "explain");
     content.append(conversation.widget());
 
     let buffer = view.buffer();

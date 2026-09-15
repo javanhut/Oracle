@@ -175,6 +175,19 @@ pub fn build(gtk_app: &adw::Application, app: &Rc<App>) -> (adw::ApplicationWind
     }
     window.add_controller(shortcuts);
 
+    // Closing the window mid-answer hides it instead, so a slow model's answer
+    // is not thrown away. With nothing coming, closing ends the app as before.
+    {
+        let app = app.clone();
+        window.connect_close_request(move |_| {
+            if !app.is_answering() {
+                return glib::Propagation::Proceed;
+            }
+            app.hide_while_answering();
+            glib::Propagation::Stop
+        });
+    }
+
     (window, Nav { list, stack, rows })
 }
 

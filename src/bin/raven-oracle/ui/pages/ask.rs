@@ -57,7 +57,7 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     }
     content.append(&examples);
 
-    let conversation = Conversation::new(app);
+    let conversation = Conversation::new(app, "ask");
     content.append(conversation.widget());
     *app.ask_conversation.borrow_mut() = Some(conversation);
 

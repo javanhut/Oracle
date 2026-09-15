@@ -8,7 +8,7 @@
   <description>
     <p>A local troubleshooting companion. Oracle reads services, storage, network, packages, logs and hardware, says what looks wrong with the evidence it saw, and suggests commands you can copy. It never runs them.</p>
     <p>With a model running on this machine, it also answers questions and explains errors you paste in. Nothing is sent anywhere else, and the exact text a model would see is shown before anything is sent.</p>
-    <p>It runs only while its window is open. There is no background service and no autostart.</p>
+    <p>It runs while its window is open, and until a pending answer has been delivered if the window is closed first. There is no background service and no autostart.</p>
   </description>
   <launchable type="desktop-id">com.ravenoracle.Raven.desktop</launchable>
   <provides>

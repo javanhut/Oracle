@@ -8,7 +8,7 @@
 //! The API is `/api/chat` with `stream: true`, which returns newline-delimited
 //! JSON objects rather than server-sent events.
 
-use super::{Availability, Backend, Message, ModelError};
+use super::{Availability, Backend, Ending, Message, ModelError, settle};
 use crate::config::Config;
 use crate::http::{self, Url};
 use serde_json::{Value, json};
@@ -192,9 +192,13 @@ impl Backend for Ollama {
             }
         })?;
 
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "stream": true,
+            // Thinking models otherwise reason first, and the reasoning counts
+            // against `num_predict`: on a question with system context the
+            // whole allowance goes on thinking and no answer is ever written.
+            "think": false,
             "messages": messages.iter().map(|m| json!({
                 "role": m.role.as_str(),
                 "content": m.content,
@@ -206,11 +210,24 @@ impl Backend for Ollama {
         });
 
         let url = self.url.join("/api/chat");
-        let resp = http::post_json(&url, body.to_string().as_bytes(), self.timeout)
-            .map_err(|e| ModelError::Failed(e.to_string()))?;
+        let resp = match http::post_json(&url, body.to_string().as_bytes(), self.timeout) {
+            // A server that refuses the field outright is asked again without
+            // it, rather than refusing to answer over a preference.
+            Err(http::HttpError::Status(400, text))
+                if text.to_ascii_lowercase().contains("think") =>
+            {
+                body.as_object_mut().map(|o| o.remove("think"));
+                http::post_json(&url, body.to_string().as_bytes(), self.timeout)
+            }
+            other => other,
+        }
+        .map_err(|e| ModelError::Failed(e.to_string()))?;
 
         let mut full = String::new();
         let mut stopped = false;
+        let mut thought = false;
+        let mut ending = Ending::Cut;
+        let mut server_error = None;
 
         resp.for_each_line(|line| {
             let line = line.trim();
@@ -223,11 +240,20 @@ impl Backend for Ollama {
                 return true;
             };
             if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-                full.push_str(&format!("\n[server error: {err}]"));
+                server_error = Some(err.to_string());
                 return false;
             }
-            if let Some(chunk) = v
-                .get("message")
+            let message = v.get("message");
+            // A model that ignores `think: false` still sends its reasoning
+            // here. It is not the answer, but it explains an empty one.
+            if message
+                .and_then(|m| m.get("thinking"))
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| !t.is_empty())
+            {
+                thought = true;
+            }
+            if let Some(chunk) = message
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_str())
                 && !chunk.is_empty()
@@ -238,14 +264,26 @@ impl Backend for Ollama {
                     return false;
                 }
             }
-            !v.get("done").and_then(|d| d.as_bool()).unwrap_or(false)
+            if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                ending = match v.get("done_reason").and_then(|r| r.as_str()) {
+                    Some("length") => Ending::Limit,
+                    _ => Ending::Complete,
+                };
+                return false;
+            }
+            true
         })
         .map_err(|e| ModelError::Failed(e.to_string()))?;
 
         if stopped {
             return Err(ModelError::Interrupted);
         }
-        Ok(full)
+        if let Some(err) = server_error {
+            return Err(ModelError::Failed(format!(
+                "the model server reported an error: {err}"
+            )));
+        }
+        settle(full, ending, thought, self.max_tokens, on_token)
     }
 }
 
@@ -465,6 +503,151 @@ mod wire {
             a.detail.unwrap().contains("model runner has crashed"),
             "the server usually explains itself; pass that through"
         );
+    }
+
+    #[test]
+    fn the_model_is_asked_to_answer_without_thinking_first() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&["{\"message\":{\"content\":\"ok\"},\"done\":true}\n"]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        o.chat(&[Message::user("q")], &mut |_| true).unwrap();
+        let chat: Value = serde_json::from_str(&server.bodies()[1]).unwrap();
+        assert_eq!(chat["think"], json!(false), "sent: {chat}");
+    }
+
+    #[test]
+    fn a_server_that_refuses_the_think_field_is_asked_again_without_it() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            error(
+                400,
+                r#"{"error":"\"qwen2.5:3b-instruct\" does not support thinking"}"#,
+            ),
+            ndjson(&["{\"message\":{\"content\":\"answer\"},\"done\":true}\n"]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        let full = o.chat(&[Message::user("q")], &mut |_| true).unwrap();
+        assert_eq!(full, "answer");
+        let retry: Value = serde_json::from_str(&server.bodies()[2]).unwrap();
+        assert!(retry.get("think").is_none(), "sent: {retry}");
+    }
+
+    #[test]
+    fn a_model_that_thinks_until_the_limit_fails_and_says_why() {
+        // What ornith-1.5:35B did: nine hundred tokens of reasoning, no answer,
+        // and a stream that ends normally. It used to be reported as success.
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&[
+                "{\"message\":{\"content\":\"\",\"thinking\":\"The user\"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"\",\"thinking\":\" says\"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"length\"}\n",
+            ]),
+        ]);
+        let (cfg, o) = config_for(&server, "");
+        let mut tokens = 0;
+        let err = o
+            .chat(&[Message::user("q")], &mut |_| {
+                tokens += 1;
+                true
+            })
+            .expect_err("no answer must not be a success");
+        let msg = err.to_string();
+        assert!(matches!(err, ModelError::Failed(_)));
+        assert!(msg.contains("thinking"), "got {msg}");
+        assert!(msg.contains(&cfg.model.max_tokens.to_string()), "got {msg}");
+        assert_eq!(
+            tokens, 0,
+            "reasoning is not the answer and must not be shown as one"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_finishes_with_no_answer_is_a_failure() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&["{\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n"]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        let err = o.chat(&[Message::user("q")], &mut |_| true).unwrap_err();
+        assert!(
+            err.to_string().contains("without writing an answer"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_answer_cut_off_by_the_limit_is_kept_and_marked() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&[
+                "{\"message\":{\"content\":\"Check the unit \"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"length\"}\n",
+            ]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        let mut seen = String::new();
+        let full = o
+            .chat(&[Message::user("q")], &mut |t| {
+                seen.push_str(t);
+                true
+            })
+            .expect("half an answer is still an answer");
+        assert!(full.starts_with("Check the unit "));
+        assert!(full.contains("Cut off"), "got {full}");
+        assert_eq!(
+            seen, full,
+            "the note must reach the screen, not only the return value"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_closes_mid_answer_is_marked() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&["{\"message\":{\"content\":\"partial\"},\"done\":false}\n"]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        let full = o.chat(&[Message::user("q")], &mut |_| true).unwrap();
+        assert!(full.contains("connection closed"), "got {full}");
+    }
+
+    #[test]
+    fn a_server_error_mid_stream_is_an_error_not_an_empty_success() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&["{\"error\":\"model runner has unexpectedly stopped\"}\n"]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        let mut tokens = 0;
+        let err = o
+            .chat(&[Message::user("q")], &mut |_| {
+                tokens += 1;
+                true
+            })
+            .expect_err("a server error must not look like a finished answer");
+        assert!(matches!(err, ModelError::Failed(_)));
+        assert!(
+            err.to_string().contains("unexpectedly stopped"),
+            "got {err}"
+        );
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn a_server_error_after_some_answer_is_still_an_error() {
+        let server = Server::start(vec![
+            sized("application/json", TAGS),
+            ndjson(&[
+                "{\"message\":{\"content\":\"The disk\"},\"done\":false}\n",
+                "{\"error\":\"out of memory\"}\n",
+            ]),
+        ]);
+        let (_cfg, o) = config_for(&server, "");
+        let err = o.chat(&[Message::user("q")], &mut |_| true).unwrap_err();
+        assert!(err.to_string().contains("out of memory"), "got {err}");
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! the part of a tool like this that people actually read.
 
 use crate::probe::Area;
-
 #[derive(Debug)]
 pub enum Command {
     /// No arguments: say what Oracle is and stop.

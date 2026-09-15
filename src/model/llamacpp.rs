@@ -9,7 +9,7 @@
 //! The stream is server-sent events: `data: {json}` per line, ending with
 //! `data: [DONE]`.
 
-use super::{Availability, Backend, Message, ModelError};
+use super::{Availability, Backend, Ending, Message, ModelError, settle};
 use crate::config::Config;
 use crate::http::{self, Url};
 use serde_json::{Value, json};
@@ -121,6 +121,9 @@ impl Backend for LlamaCpp {
 
         let mut full = String::new();
         let mut stopped = false;
+        let mut thought = false;
+        let mut ending = Ending::Cut;
+        let mut server_error = None;
 
         resp.for_each_line(|line| {
             let line = line.trim();
@@ -129,6 +132,9 @@ impl Backend for LlamaCpp {
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
+                if ending == Ending::Cut {
+                    ending = Ending::Complete;
+                }
                 return false;
             }
             let Ok(v) = serde_json::from_str::<Value>(payload) else {
@@ -138,17 +144,23 @@ impl Backend for LlamaCpp {
                 let msg = err
                     .get("message")
                     .and_then(|m| m.as_str())
-                    .unwrap_or("the server reported an error");
-                full.push_str(&format!("\n[server error: {msg}]"));
+                    .unwrap_or("no reason given");
+                server_error = Some(msg.to_string());
                 return false;
             }
-            let chunk = v
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
+            let choice = v.get("choices").and_then(|c| c.get(0));
+            let delta = choice.and_then(|c| c.get("delta"));
+            // Reasoning models on llama-server send their thinking here.
+            if delta
+                .and_then(|d| d.get("reasoning_content"))
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| !r.is_empty())
+            {
+                thought = true;
+            }
+            if let Some(chunk) = delta
                 .and_then(|d| d.get("content"))
-                .and_then(|c| c.as_str());
-            if let Some(chunk) = chunk
+                .and_then(|c| c.as_str())
                 && !chunk.is_empty()
             {
                 full.push_str(chunk);
@@ -157,6 +169,14 @@ impl Backend for LlamaCpp {
                     return false;
                 }
             }
+            match choice
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(|r| r.as_str())
+            {
+                Some("length") => ending = Ending::Limit,
+                Some(_) => ending = Ending::Complete,
+                None => {}
+            }
             true
         })
         .map_err(|e| ModelError::Failed(e.to_string()))?;
@@ -164,7 +184,12 @@ impl Backend for LlamaCpp {
         if stopped {
             return Err(ModelError::Interrupted);
         }
-        Ok(full)
+        if let Some(err) = server_error {
+            return Err(ModelError::Failed(format!(
+                "the model server reported an error: {err}"
+            )));
+        }
+        settle(full, ending, thought, self.max_tokens, on_token)
     }
 }
 
@@ -325,8 +350,48 @@ mod wire {
             "data: {\"error\":{\"message\":\"context window exceeded\"}}\n\n",
         ])]);
         let l = backend(&server, "");
+        let err = l
+            .chat(&[Message::user("q")], &mut |_| true)
+            .expect_err("a server error must not look like a finished answer");
+        assert!(matches!(err, ModelError::Failed(_)));
+        assert!(
+            err.to_string().contains("context window exceeded"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn reasoning_until_the_limit_fails_and_says_why() {
+        let server = Server::start(vec![sse(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])]);
+        let l = backend(&server, "");
+        let err = l.chat(&[Message::user("q")], &mut |_| true).unwrap_err();
+        assert!(err.to_string().contains("thinking"), "got {err}");
+    }
+
+    #[test]
+    fn an_answer_cut_off_by_the_limit_is_kept_and_marked() {
+        let server = Server::start(vec![sse(&[
+            &delta("Swap is"),
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])]);
+        let l = backend(&server, "");
         let full = l.chat(&[Message::user("q")], &mut |_| true).unwrap();
-        assert!(full.contains("context window exceeded"), "got {full}");
+        assert!(
+            full.starts_with("Swap is") && full.contains("Cut off"),
+            "got {full}"
+        );
+    }
+
+    #[test]
+    fn a_stream_with_no_answer_is_a_failure() {
+        let server = Server::start(vec![sse(&["data: [DONE]\n\n"])]);
+        let l = backend(&server, "");
+        assert!(l.chat(&[Message::user("q")], &mut |_| true).is_err());
     }
 
     #[test]

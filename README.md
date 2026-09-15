@@ -19,9 +19,11 @@ the base system requires it, references it, or knows it exists.
 - It is in no install profile. A fresh Raven install does not have it.
 - It adds no service to `/etc/raven/init.d` and no script to
   `/etc/raven/session.d`.
-- It has no autostart entry, no tray icon and no background process. The
-  desktop app sits in the launcher like any other Raven app and runs only while
-  its window is open.
+- It has no autostart entry, no tray icon and no background service. The
+  desktop app sits in the launcher like any other Raven app and runs while its
+  window is open. The one exception is an answer still coming from the model:
+  closing the window then hides it until the answer is ready, a notification
+  says so, and the app ends once the answer has been opened or dismissed.
 - Installing it puts two binaries, a launcher entry, its metainfo and an icon
   under `/usr/local`. Nothing in `/etc` is touched.
 - Uninstalling removes all of that. `oracle forget` (or *Forget Everything* in

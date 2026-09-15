@@ -7,6 +7,7 @@
 //! copies one. It talks to a model on this machine or to none.
 
 pub mod answer;
+pub mod notify;
 pub mod pages;
 pub mod state;
 pub mod theme;
@@ -50,6 +51,9 @@ pub struct App {
     /// The Ask page's conversation, so a finding can be explained from the
     /// Findings page.
     pub ask_conversation: RefCell<Option<Rc<answer::Conversation>>>,
+    /// How many answers are still coming, across Ask and Explain.
+    answering: Cell<usize>,
+    notifier: Rc<notify::Notifier>,
 }
 
 impl App {
@@ -80,6 +84,72 @@ impl App {
             if nav.stack.child_by_name(id).is_some() {
                 nav.stack.set_visible_child_name(id);
             }
+        }
+    }
+
+    /// The page on screen, as one of `pages::ids`.
+    fn visible_page(&self) -> Option<&'static str> {
+        let nav = self.nav.borrow();
+        let name = nav.as_ref()?.stack.visible_child_name()?;
+        pages::ids().into_iter().find(|id| *id == name.as_str())
+    }
+
+    /// Whether any answer is still coming.
+    pub fn is_answering(&self) -> bool {
+        self.answering.get() > 0
+    }
+
+    pub fn answer_began(&self) {
+        self.answering.set(self.answering.get() + 1);
+    }
+
+    /// An answer on `page` ended. `report` is what to say about it, or `None`
+    /// when the person stopped it and so already knows.
+    pub fn answer_ended(self: &Rc<Self>, page: &'static str, report: Option<notify::Report>) {
+        self.answering.set(self.answering.get().saturating_sub(1));
+        let Some(report) = report else {
+            return;
+        };
+        let window = self.window();
+        let on_page = self.visible_page() == Some(page);
+        if !notify::worth_notifying(window.is_visible(), window.is_active(), on_page) {
+            return;
+        }
+        let app = self.clone();
+        self.notifier.send(&report, move |event| {
+            app.on_notification(notify::Kind::Ready, page, event)
+        });
+    }
+
+    /// The window was closed while an answer was still coming. It is hidden
+    /// rather than ended, and comes back through the notification when the
+    /// answer is ready.
+    pub fn hide_while_answering(self: &Rc<Self>) {
+        let window = self.window();
+        let page = self.visible_page().unwrap_or("ask");
+        window.set_visible(false);
+        let app = self.clone();
+        self.notifier.send(&notify::working(), move |event| {
+            app.on_notification(notify::Kind::Working, page, event)
+        });
+    }
+
+    fn on_notification(
+        self: &Rc<Self>,
+        kind: notify::Kind,
+        page: &'static str,
+        event: notify::Event,
+    ) {
+        let window = self.window();
+        match notify::respond(kind, event, !window.is_visible(), self.is_answering()) {
+            notify::Response::Show => {
+                window.present();
+                self.navigate(page);
+            }
+            // Nothing is coming, so the close request goes through and the
+            // app ends with its window.
+            notify::Response::Quit => window.close(),
+            notify::Response::Nothing => {}
         }
     }
 
@@ -339,6 +409,8 @@ pub fn open(gtk_app: &adw::Application, desktop: &Desktop, cfg: Config, start_pa
         listeners: RefCell::new(Vec::new()),
         nav: RefCell::new(None),
         ask_conversation: RefCell::new(None),
+        answering: Cell::new(0),
+        notifier: Rc::new(notify::Notifier::default()),
     });
 
     let (window, nav) = window::build(gtk_app, &app);

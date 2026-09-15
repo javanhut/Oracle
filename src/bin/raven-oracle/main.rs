@@ -4,8 +4,11 @@
 //! window that looks like the rest of Raven. It holds to the rules the command
 //! line does: it checks the machine when it opens and when asked, never on a
 //! timer; it never runs a suggested command, only copies one; and it talks to
-//! a model on this machine or to none. Closing the window ends it. There is no
-//! background process, tray icon or autostart entry.
+//! a model on this machine or to none. Closing the window ends it -- unless an
+//! answer is still coming, in which case the window hides until that answer
+//! is ready, says so with a notification, and the app ends once it has been
+//! seen. There is no tray icon, no autostart entry, and nothing that starts it
+//! without being opened.
 
 mod desktop;
 mod ui;

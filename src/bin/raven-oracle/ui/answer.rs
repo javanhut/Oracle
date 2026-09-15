@@ -5,9 +5,13 @@
 //! channel the main loop drains. Starting a new answer, or pressing Stop,
 //! bumps a generation counter and raises a cancel flag, so a stopped answer
 //! stays stopped and an old one can never overwrite a newer one.
+//!
+//! An answer keeps coming whatever the window is doing -- on another page,
+//! behind another window, or hidden after being closed -- and the app is told
+//! when it ends, so it can send a notification when nobody is looking.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, TryRecvError};
@@ -19,7 +23,7 @@ use libadwaita::prelude::*;
 use oracle::config::Config;
 use oracle::model::{self, Message, ModelError};
 
-use super::{App, state, widgets};
+use super::{App, notify, state, widgets};
 
 enum Update {
     /// The context is gathered and the question is with the model.
@@ -29,7 +33,19 @@ enum Update {
     Failed(String),
 }
 
+/// How an answer ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Answered,
+    Failed,
+    /// The person pressed Stop, so there is nothing to tell them.
+    Stopped,
+}
+
 pub struct Conversation {
+    app: Weak<App>,
+    /// The page this conversation is on, for bringing it back into view.
+    page: &'static str,
     root: gtk::Box,
     heading: gtk::Label,
     spinner: gtk::Spinner,
@@ -39,10 +55,13 @@ pub struct Conversation {
     buffer: gtk::TextBuffer,
     generation: Cell<u64>,
     cancel: RefCell<Arc<AtomicBool>>,
+    /// Whether an answer is coming, so the app's count of them stays right
+    /// when a new question replaces one mid-answer.
+    running: Cell<bool>,
 }
 
 impl Conversation {
-    pub fn new(app: &Rc<App>) -> Rc<Conversation> {
+    pub fn new(app: &Rc<App>, page: &'static str) -> Rc<Conversation> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
         root.add_css_class("raven-card");
         root.set_visible(false);
@@ -83,6 +102,8 @@ impl Conversation {
         root.append(&view);
 
         let conversation = Rc::new(Conversation {
+            app: Rc::downgrade(app),
+            page,
             root,
             heading,
             spinner,
@@ -92,6 +113,7 @@ impl Conversation {
             buffer,
             generation: Cell::new(0),
             cancel: RefCell::new(Arc::new(AtomicBool::new(false))),
+            running: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&conversation);
@@ -127,6 +149,11 @@ impl Conversation {
         *self.cancel.borrow_mut() = cancel.clone();
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        // A question asked over an unfinished answer replaces it: still one
+        // answer coming, not two.
+        if !self.running.replace(true) {
+            app.answer_began();
+        }
 
         self.root.set_visible(true);
         self.heading.set_text(heading);
@@ -158,21 +185,32 @@ impl Conversation {
                         conversation.buffer.insert(&mut end, &t);
                         conversation.status.set_text("Answering…");
                     }
+                    // The backends report an empty answer as a failure; this
+                    // is the last line of defence against a blank card that
+                    // says it succeeded.
+                    Ok(Update::Finished) if conversation.buffer.char_count() == 0 => {
+                        conversation.finish(
+                            "The model finished without writing an answer.",
+                            Outcome::Failed,
+                        );
+                        return glib::ControlFlow::Break;
+                    }
                     Ok(Update::Finished) => {
                         conversation.finish(
                             "From the local model. The findings are certain; this is not, so \
                              check it against them.",
-                            false,
+                            Outcome::Answered,
                         );
                         return glib::ControlFlow::Break;
                     }
                     Ok(Update::Failed(e)) => {
-                        conversation.finish(&e, true);
+                        conversation.finish(&e, Outcome::Failed);
                         return glib::ControlFlow::Break;
                     }
                     Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
                     Err(TryRecvError::Disconnected) => {
-                        conversation.finish("The model stopped without finishing.", true);
+                        conversation
+                            .finish("The model stopped without finishing.", Outcome::Failed);
                         return glib::ControlFlow::Break;
                     }
                 }
@@ -185,19 +223,38 @@ impl Conversation {
         self.generation.set(self.generation.get() + 1);
         self.finish(
             "Stopped. The model was told to stop, and anything it sends now is dropped.",
-            false,
+            Outcome::Stopped,
         );
     }
 
-    fn finish(&self, status: &str, failed: bool) {
+    fn finish(&self, status: &str, outcome: Outcome) {
         self.spinner.stop();
         self.spinner.set_visible(false);
         self.stop.set_visible(false);
         self.copy.set_visible(self.buffer.char_count() > 0);
         self.status.set_text(status);
-        if failed {
+        if outcome == Outcome::Failed {
             self.status.add_css_class("error");
         }
+
+        if !self.running.replace(false) {
+            return;
+        }
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let heading = self.heading.text();
+        let report = match outcome {
+            Outcome::Stopped => None,
+            Outcome::Failed => Some(notify::report(&heading, true, status)),
+            Outcome::Answered => {
+                let answer =
+                    self.buffer
+                        .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false);
+                Some(notify::report(&heading, false, &answer))
+            }
+        };
+        app.answer_ended(self.page, report);
     }
 }
 
