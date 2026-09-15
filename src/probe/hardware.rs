@@ -7,6 +7,7 @@
 //! `/sys`, and none of them is obvious from the desktop.
 
 use serde::Serialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Hardware {
@@ -227,8 +228,22 @@ fn missing_firmware() -> Vec<String> {
         return Vec::new();
     };
 
+    // The ring buffer keeps a failure until the next reboot, even when a later
+    // load succeeded: a driver that asks before the filesystem holding the
+    // firmware is mounted asks again once it is. So a failure only counts
+    // while the file is still absent from everywhere the loader looks.
+    let search = firmware_search_path();
+    let mut missing = failed_firmware_loads(text);
+    missing.retain(|name| !firmware_installed(name, &search));
+    missing.truncate(8);
+    missing
+}
+
+/// Firmware named in the kernel's failed-load messages, in the order they
+/// failed.
+fn failed_firmware_loads(dmesg: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
+    for line in dmesg.lines() {
         let low = line.to_ascii_lowercase();
         let failed = low.contains("firmware")
             && (low.contains("failed to load")
@@ -250,8 +265,48 @@ fn missing_firmware() -> Vec<String> {
             out.push(name);
         }
     }
-    out.truncate(8);
     out
+}
+
+/// The directories the kernel's firmware loader searches.
+fn firmware_search_path() -> Vec<PathBuf> {
+    let release = crate::sys::read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut dirs = Vec::new();
+    if let Some(custom) = crate::sys::read_trimmed("/sys/module/firmware_class/parameters/path")
+        && !custom.is_empty()
+    {
+        dirs.push(PathBuf::from(custom));
+    }
+    for base in ["/lib/firmware", "/usr/lib/firmware"] {
+        if !release.is_empty() {
+            dirs.push(PathBuf::from(format!("{base}/updates/{release}")));
+        }
+        dirs.push(PathBuf::from(format!("{base}/updates")));
+        if !release.is_empty() {
+            dirs.push(PathBuf::from(format!("{base}/{release}")));
+        }
+        dirs.push(PathBuf::from(base));
+    }
+    dirs
+}
+
+/// Whether `name` is in one of `dirs`, as is or compressed the way the kernel
+/// can load it.
+fn firmware_installed(name: &str, dirs: &[PathBuf]) -> bool {
+    // Anything but a plain relative path is a whole log line the parser could
+    // not pick a file out of, and there is nothing on disk to look for.
+    if name.is_empty()
+        || name.starts_with('/')
+        || name.contains(char::is_whitespace)
+        || name.split('/').any(|c| c == "..")
+    {
+        return false;
+    }
+    dirs.iter().any(|dir| {
+        ["", ".zst", ".xz"]
+            .iter()
+            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+    })
 }
 
 fn virtualisation() -> Option<String> {
@@ -319,6 +374,33 @@ impl Hardware {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_load_names_the_file_once() {
+        let dmesg = "\
+[    0.885686] Bluetooth: hci0: RTL: loading rtl_bt/rtl8821c_fw.bin
+[    0.885750] bluetooth hci0: Direct firmware load for rtl_bt/rtl8821c_fw.bin failed with error -2
+[    0.885755] Bluetooth: hci0: RTL: firmware file rtl_bt/rtl8821c_fw not found
+[  199.684214] Bluetooth: hci0: RTL: loading rtl_bt/rtl8821c_fw.bin";
+        assert_eq!(failed_firmware_loads(dmesg), vec!["rtl_bt/rtl8821c_fw.bin"]);
+    }
+
+    #[test]
+    fn firmware_that_is_on_disk_is_not_missing() {
+        // An early-boot failure stays in dmesg after the retry succeeds, which
+        // is how this used to report firmware that was sitting right there.
+        let dir = std::env::temp_dir().join(format!("oracle-fw-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("rtl_bt")).unwrap();
+        std::fs::write(dir.join("rtl_bt/rtl8821c_fw.bin"), b"fw").unwrap();
+        std::fs::write(dir.join("rtl_bt/packed_fw.bin.zst"), b"fw").unwrap();
+        let dirs = vec![PathBuf::from("/nonexistent"), dir.clone()];
+
+        assert!(firmware_installed("rtl_bt/rtl8821c_fw.bin", &dirs));
+        assert!(firmware_installed("rtl_bt/packed_fw.bin", &dirs));
+        assert!(!firmware_installed("rtl_bt/absent_fw.bin", &dirs));
+        assert!(!firmware_installed("an unparsed log line", &dirs));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn memory_percentages_use_available_not_free() {

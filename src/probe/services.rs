@@ -41,7 +41,7 @@ pub struct RavenService {
     /// A `ready_path` the service promises to create, and whether it is there.
     pub ready_path: Option<String>,
     pub ready_present: Option<bool>,
-    /// The tail of this service's log, when it has one.
+    /// Error lines this boot wrote to this service's log, when it has one.
     pub log_errors: Vec<String>,
     pub log_path: Option<String>,
     /// How long ago the log was last written. Errors in a log nothing has
@@ -157,7 +157,7 @@ fn inspect(def: ServiceDef, source: &str) -> RavenService {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_secs());
-        (recent_errors(&candidate), Some(candidate), age)
+        (this_boot_errors(&candidate, 400, 4), Some(candidate), age)
     } else {
         (Vec::new(), None, None)
     };
@@ -180,27 +180,242 @@ fn inspect(def: ServiceDef, source: &str) -> RavenService {
     }
 }
 
-/// Error-looking lines from the tail of a service log.
+/// Error-looking lines this boot wrote to a log, oldest first.
+///
+/// raven-init appends to the same file across boots, so the tail of a log is
+/// often last week's. Reporting those lines as happening now is the kind of
+/// wrong answer that teaches people to ignore the report, so anything that
+/// cannot be placed in this boot is left out.
 ///
 /// Matching on words rather than on a log format keeps this working across the
 /// several shapes of line the Raven daemons emit. The precision comes from
 /// three constraints rather than from a parser: the marker has to stand as its
 /// own word, lines that are really command invocations are rejected outright,
 /// and near-identical repeats collapse to one.
-fn recent_errors(path: &str) -> Vec<String> {
-    let Some(lines) = crate::sys::tail(path, 400) else {
+pub fn this_boot_errors(path: impl AsRef<Path>, window: usize, keep: usize) -> Vec<String> {
+    let path = path.as_ref();
+    let boot = crate::sys::boot_time();
+    // A log nothing has written since boot holds nothing from this boot.
+    if let (Some(boot), Some(modified)) = (boot, crate::sys::modified_epoch(path))
+        && modified < boot
+    {
+        return Vec::new();
+    }
+    let Some(lines) = crate::sys::tail(path, window) else {
         return Vec::new();
     };
-    let mut hits: Vec<String> = lines
+    let first = crate::sys::first_line(path);
+    let mut hits: Vec<String> = current_run(lines, first.as_deref(), boot)
         .into_iter()
         .filter(|l| is_error_line(l))
         .map(|l| crate::sys::truncate_line(&l, MAX_LOG_LINE))
         .collect();
+    // Keep the latest of each repeat, so the evidence shows when it last
+    // happened rather than when it first did.
+    hits.reverse();
     dedupe_similar(&mut hits);
+    hits.reverse();
     // Keep the most recent few; a wall of repeated errors helps nobody.
-    let start = hits.len().saturating_sub(4);
+    let start = hits.len().saturating_sub(keep);
     hits.drain(..start);
     hits
+}
+
+/// How far behind the boot time a line's timestamp may fall and still count
+/// as this boot, for a clock that was stepped after the kernel started.
+const CLOCK_SLACK_SECONDS: u64 = 5;
+
+/// The part of a log's tail written since this boot, as far as the log lets
+/// that be told.
+///
+/// Three signals, in order of how far they can be trusted: a timestamp at the
+/// start of a line, compared with the boot time; the pid in a `name[pid]:`
+/// prefix, which changes whenever the daemon starts again; and the line a
+/// daemon writes first every time it starts, whose last appearance marks its
+/// latest start. A log with none of these is kept whole, which is safe because
+/// its modified time has already been checked against the boot.
+pub fn current_run(lines: Vec<String>, first_line: Option<&str>, boot: Option<u64>) -> Vec<String> {
+    let start = run_start(&lines, first_line, boot);
+    lines.into_iter().skip(start).collect()
+}
+
+fn run_start(lines: &[String], first_line: Option<&str>, boot: Option<u64>) -> usize {
+    if let Some(boot) = boot {
+        let stamped: Vec<(usize, u64)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| leading_timestamp(l).map(|t| (i, t)))
+            .collect();
+        if !stamped.is_empty() {
+            return stamped
+                .iter()
+                .rev()
+                .find(|(_, t)| t + CLOCK_SLACK_SECONDS < boot)
+                .map_or(0, |(i, _)| i + 1);
+        }
+    }
+
+    let tagged: Vec<(usize, u32)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| tagged_pid(l).map(|p| (i, p)))
+        .collect();
+    if let Some(&(_, latest)) = tagged.last() {
+        // The last unbroken run of the latest pid, since pids repeat across
+        // boots.
+        return tagged
+            .iter()
+            .rev()
+            .find(|(_, p)| *p != latest)
+            .map_or(0, |(i, _)| i + 1);
+    }
+
+    // A clock counting from the start of the boot or of the daemon, the way
+    // raven-init and seatd stamp their lines, goes backwards when either
+    // starts again.
+    let elapsed: Vec<(usize, f64)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| elapsed_stamp(l).map(|t| (i, t)))
+        .collect();
+    if let Some(reset) = elapsed.windows(2).rev().find(|w| w[1].1 < w[0].1) {
+        return reset[1].0;
+    }
+
+    // A banner that is itself an error would cut the log at its latest error
+    // and hide everything before it.
+    if let Some(banner) = first_line
+        .map(str::trim_end)
+        .filter(|b| !b.trim().is_empty() && !is_error_line(b))
+        && let Some(i) = lines.iter().rposition(|l| l.trim_end() == banner)
+    {
+        return i;
+    }
+    0
+}
+
+/// The pid in a `name[pid]:` prefix, the way dbus and bluetoothd write it.
+fn tagged_pid(line: &str) -> Option<u32> {
+    let head = line.split_whitespace().next()?.strip_suffix("]:")?;
+    let (name, pid) = head.split_once('[')?;
+    if name.is_empty() {
+        return None;
+    }
+    digits(pid)?.try_into().ok()
+}
+
+/// A stamp counting seconds from some start rather than from the epoch:
+/// `[    4.094]` as the kernel and raven-init write it near the start of a
+/// line, or `00:00:05.940` as seatd does.
+fn elapsed_stamp(line: &str) -> Option<f64> {
+    let decimal = |s: &str| {
+        let (whole, fraction) = s.split_once('.')?;
+        digits(whole)?;
+        digits(fraction)?;
+        s.parse::<f64>().ok()
+    };
+
+    for piece in line.split('[').skip(1).take(3) {
+        if let Some((inner, _)) = piece.split_once(']')
+            && let Some(t) = decimal(inner.trim_start())
+        {
+            return Some(t);
+        }
+    }
+
+    let first = line.split_whitespace().next()?;
+    let mut parts = first.splitn(3, ':');
+    let (h, m, s) = (parts.next()?, parts.next()?, parts.next()?);
+    if h.len() != 2 || m.len() != 2 {
+        return None;
+    }
+    Some((digits(h)? * 3600 + digits(m)? * 60) as f64 + decimal(s)?)
+}
+
+/// An RFC 3339 timestamp at the start of a line, in seconds since the epoch,
+/// with or without the bracket and colour codes the Raven daemons put around
+/// it.
+fn leading_timestamp(line: &str) -> Option<u64> {
+    let plain = strip_ansi(line);
+    let s = plain.trim_start().trim_start_matches('[');
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let field = |from: usize, to: usize| s.get(from..to).and_then(digits);
+    let (year, month, day) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
+    let (hour, minute, second) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    // Every byte before 19 was checked to be ASCII, so this slices cleanly.
+    let mut rest = &s[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        rest = fraction.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match *rest.as_bytes().first()? {
+        b'Z' | b'z' => 0,
+        sign @ (b'+' | b'-') => {
+            if rest.as_bytes().get(3) != Some(&b':') {
+                return None;
+            }
+            let secs = digits(rest.get(1..3)?)? * 3600 + digits(rest.get(4..6)?)? * 60;
+            if sign == b'+' { secs } else { -secs }
+        }
+        _ => return None,
+    };
+
+    let epoch =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    u64::try_from(epoch).ok()
+}
+
+fn digits(s: &str) -> Option<i64> {
+    (!s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// A line with its terminal colour codes removed.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The longest log line worth putting in a report.
@@ -479,6 +694,132 @@ mod tests {
         let live = s.logging_errors(7 * 86_400);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].name, "dbus");
+    }
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn timestamps_from_before_this_boot_are_dropped() {
+        // 2026-09-15T17:14:34Z
+        let boot = 1_789_492_474;
+        let log = lines(
+            "[2026-09-14T13:59:23Z WARN  raven_timed] Sync failed: last boot\n\
+             [2026-09-15T15:37:25Z WARN  raven_timed] Sync failed: also last boot\n\
+             [2026-09-15T17:14:39Z INFO  raven_timed] raven-timed: zone America/New_York\n\
+             [2026-09-15T17:17:09Z WARN  raven_timed] Sync failed: this boot",
+        );
+        let run = current_run(log, None, Some(boot));
+        assert_eq!(run.len(), 2, "got {run:?}");
+        assert!(run[1].ends_with("this boot"));
+    }
+
+    #[test]
+    fn timestamps_are_read_through_colour_codes_and_offsets() {
+        assert_eq!(leading_timestamp("1970-01-01T00:00:00Z x"), Some(0));
+        assert_eq!(
+            leading_timestamp("[2000-03-01T00:00:00Z x"),
+            Some(951_868_800)
+        );
+        assert_eq!(
+            leading_timestamp("2000-03-01T01:00:00.123+01:00 x"),
+            Some(951_868_800)
+        );
+        assert_eq!(
+            leading_timestamp("\u{1b}[2m2026-09-15T17:14:34.026075Z\u{1b}[0m \u{1b}[32m INFO"),
+            Some(1_789_492_474)
+        );
+        assert_eq!(
+            leading_timestamp("00:00:05.940 [INFO] [seatd/seat.c:584]"),
+            None
+        );
+        assert_eq!(
+            leading_timestamp("raven-fstrim: trimming (2026-09-14 10:04)"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_latest_pid_counts_even_when_an_old_boot_reused_it() {
+        let log = lines(
+            "dbus-daemon[164]: activation failed: two boots ago\n\
+             dbus-daemon[161]: activation failed: last boot\n\
+             dbus[164]: Unknown username \"polkitd\"\n\
+             dbus-daemon[164]: activation failed: this boot",
+        );
+        let run = current_run(log, None, Some(1_789_492_474));
+        assert_eq!(run.len(), 2, "got {run:?}");
+        assert!(run[1].ends_with("this boot"));
+    }
+
+    #[test]
+    fn an_uptime_clock_going_backwards_marks_the_boot() {
+        let log = lines(
+            "[raven-init] [ 5016.714] INFO: Re-executed as PID 1\n\
+             [raven-init] [ 5016.937] ERROR: network exited: last boot\n\
+             [raven-init] [    3.893] INFO: Mounted /boot/efi\n\
+             [raven-init] [    9.100] ERROR: network exited: this boot",
+        );
+        let run = current_run(log, None, None);
+        assert_eq!(run.len(), 2, "got {run:?}");
+        assert!(run[1].ends_with("this boot"));
+
+        let seatd = lines(
+            "00:00:05.940 [ERROR] [seatd/seat.c:584] last start\n\
+             00:00:00.000 [INFO] [seatd/seat.c:48] Created VT-bound seat seat0\n\
+             00:00:01.200 [ERROR] [seatd/seat.c:584] this start",
+        );
+        assert_eq!(current_run(seatd, None, None).len(), 2);
+
+        // Chromium's `[pid:tid:date/time.micros:LEVEL]` is not an elapsed clock.
+        assert_eq!(
+            elapsed_stamp("[5866:1:0915/142324.368502:ERROR:puffpatch.cc:1] x"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_repeated_startup_line_marks_the_latest_start() {
+        let log = lines(
+            "cawd: connection failed: before the restart\n\
+             cawd: listening on /run/caw/caw.sock\n\
+             cawd: connection failed: since the restart",
+        );
+        let run = current_run(log, Some("cawd: listening on /run/caw/caw.sock"), None);
+        assert_eq!(run.len(), 2, "got {run:?}");
+        assert!(run[1].ends_with("since the restart"));
+    }
+
+    #[test]
+    fn a_first_line_that_is_an_error_is_not_taken_for_a_startup_line() {
+        let log = lines("cawd: connection failed\ncawd: link up\ncawd: connection failed");
+        let run = current_run(log.clone(), Some("cawd: connection failed"), None);
+        assert_eq!(run, log);
+    }
+
+    #[test]
+    fn a_log_with_nothing_to_place_it_is_kept_whole() {
+        let log = lines("rvnd: failed to bind\nrvnd: retrying");
+        assert_eq!(current_run(log.clone(), None, Some(1_789_492_474)), log);
+    }
+
+    #[test]
+    fn evidence_is_this_boots_latest_repeat() {
+        let dir = std::env::temp_dir().join(format!("oracle-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dbus.log");
+        std::fs::write(
+            &path,
+            "dbus-daemon[9164]: activation failed 0\n\
+             dbus-daemon[9161]: started\n\
+             dbus-daemon[9161]: activation failed 1\n\
+             dbus-daemon[9161]: activation failed 2\n",
+        )
+        .unwrap();
+        let errors = this_boot_errors(&path, 400, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(errors, vec!["dbus-daemon[9161]: activation failed 2"]);
     }
 
     #[test]

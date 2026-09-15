@@ -2,8 +2,9 @@
 //!
 //! Oracle reads three places, in the order a Raven system is likely to have
 //! them: the per-service logs `raven-init` writes, the kernel ring buffer, and
-//! the systemd journal when there is one. Only error-looking lines survive,
-//! and only the most recent handful of those, because the value of a log in a
+//! the systemd journal when there is one. Only error-looking lines from this
+//! boot survive, and only the most recent handful of those, because the
+//! value of a log in a
 //! diagnosis is the two lines before the failure and not the ten thousand
 //! before those.
 
@@ -60,20 +61,14 @@ fn collect_raven(l: &mut Logs, max_lines: usize) {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let Some(lines) = crate::sys::tail(&path, max_lines * 5) else {
+        // Checked on its own, so a log with nothing from this boot is not
+        // mistaken for one this account cannot open.
+        if std::fs::File::open(&path).is_err() {
             l.unreadable.push(path.to_string_lossy().into_owned());
             continue;
-        };
+        }
 
-        let mut errors: Vec<String> = lines
-            .into_iter()
-            .filter(|line| crate::probe::services::is_error_line(line))
-            .map(|line| crate::sys::truncate_line(&line, crate::probe::services::MAX_LOG_LINE))
-            .collect();
-        dedupe_keeping_order(&mut errors);
-        let start = errors.len().saturating_sub(6);
-        errors.drain(..start);
-
+        let errors = crate::probe::services::this_boot_errors(&path, max_lines * 5, 6);
         if errors.is_empty() {
             continue;
         }

@@ -240,6 +240,39 @@ pub fn uptime() -> Option<u64> {
     Some(secs as u64)
 }
 
+/// When this boot started, in seconds since the epoch.
+pub fn boot_time() -> Option<u64> {
+    read("/proc/stat")?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// When a file was last written, in seconds since the epoch.
+pub fn modified_epoch(path: impl AsRef<Path>) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// The first line of a file, without reading the rest of it.
+pub fn first_line(path: impl AsRef<Path>) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(f.take(4096))
+        .read_line(&mut line)
+        .ok()?;
+    let line = line.trim_end_matches(['\n', '\r']).to_string();
+    (!line.is_empty()).then_some(line)
+}
+
 /// Bound a log line to something that fits in a report.
 ///
 /// Logs contain single lines thousands of characters long -- a compiler
