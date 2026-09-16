@@ -43,6 +43,7 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
         .hexpand(true)
         .build();
     row.append(&entry);
+    row.append(&widgets::paste_button(&entry));
     let send = gtk::Button::with_label("Ask");
     send.add_css_class("suggested-action");
     row.append(&send);

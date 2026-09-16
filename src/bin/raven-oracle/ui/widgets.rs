@@ -1,4 +1,4 @@
-//! Building blocks shared by the pages: page headers, cards, rows.
+//! Building blocks shared by the pages: page headers, cards, rows, buttons.
 
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -193,4 +193,38 @@ pub fn set_columns_stacked(root: &impl IsA<gtk::Widget>, stacked: bool) {
         }
     }
     walk(root.upcast_ref(), stacked);
+}
+
+/// A `Paste` button that drops the clipboard into `target`, an entry or a
+/// text view.
+///
+/// This is GTK's own paste path, the one Ctrl+V is bound to: the transfer
+/// happens inside GTK, the text lands at the cursor instead of replacing what
+/// is already there, and on a text view it joins the undo stack. Reading the
+/// clipboard by hand left the button looking dead until the read came back.
+pub fn paste_button(target: &impl IsA<gtk::Widget>) -> gtk::Button {
+    let button = gtk::Button::with_label("Paste");
+    button.set_tooltip_text(Some("Paste from the clipboard"));
+    let target = target.as_ref().clone();
+    button.connect_clicked(move |_| paste_into(&target));
+    button
+}
+
+/// Paste into `target` as if Ctrl+V had been pressed in it.
+fn paste_into(target: &gtk::Widget) {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    if let Some(view) = target.downcast_ref::<gtk::TextView>() {
+        view.buffer()
+            .paste_clipboard(&display.clipboard(), None, view.is_editable());
+        view.grab_focus();
+    } else if let Some(editable) = target.downcast_ref::<gtk::Editable>() {
+        // An entry does its editing in a child widget, and that is where the
+        // paste action lives, not on the entry itself.
+        target.grab_focus();
+        if let Some(delegate) = editable.delegate() {
+            let _ = delegate.activate_action("clipboard.paste", None);
+        }
+    }
 }

@@ -24,9 +24,7 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     body.append(&well);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let paste = gtk::Button::with_label("Paste");
-    paste.set_tooltip_text(Some("Paste from the clipboard"));
-    buttons.append(&paste);
+    buttons.append(&widgets::paste_button(&view));
     let clear = gtk::Button::with_label("Clear");
     buttons.append(&clear);
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -42,21 +40,6 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     content.append(conversation.widget());
 
     let buffer = view.buffer();
-    {
-        let buffer = buffer.clone();
-        paste.connect_clicked(move |_| {
-            let Some(display) = gtk::gdk::Display::default() else {
-                return;
-            };
-            let clipboard = display.clipboard();
-            let buffer = buffer.clone();
-            glib::spawn_future_local(async move {
-                if let Ok(Some(text)) = clipboard.read_text_future().await {
-                    buffer.set_text(&text);
-                }
-            });
-        });
-    }
     {
         let buffer = buffer.clone();
         clear.connect_clicked(move |_| buffer.set_text(""));
