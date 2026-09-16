@@ -1,5 +1,12 @@
-//! One conversation with the local model: a heading, a status line, and the
-//! answer as it streams in. Ask and Explain each own one.
+//! One conversation with the local model: the turns that are finished, then a
+//! heading, a status line, and the answer as it streams in. Ask and Explain
+//! each own one.
+//!
+//! It is a conversation rather than an answer because troubleshooting is
+//! rarely settled in one. The reply box under an answer continues the thread,
+//! and every turn re-reads the machine before it asks, so the answer to "did
+//! that work?" is based on the system as it is now rather than as it was
+//! before the person tried anything.
 //!
 //! The model call runs on a thread of its own and sends tokens back over a
 //! channel the main loop drains. Starting a new answer, or pressing Stop,
@@ -21,7 +28,10 @@ use gtk4 as gtk;
 use libadwaita::prelude::*;
 
 use oracle::config::Config;
+use oracle::diagnose;
 use oracle::model::{self, Message, ModelError};
+use oracle::probe::{self, ProbeOptions, SystemView};
+use oracle::prompt::{self, Exchange};
 
 use super::{App, notify, state, widgets};
 
@@ -47,6 +57,17 @@ pub struct Conversation {
     /// The page this conversation is on, for bringing it back into view.
     page: &'static str,
     root: gtk::Box,
+    /// The turns that are finished, in order.
+    history: gtk::Box,
+    /// How many of `past` have been drawn into `history`. The newest answer
+    /// stays in the live view until something replaces it, so that the Copy
+    /// button still has something to copy.
+    frozen: Cell<usize>,
+    past: RefCell<Vec<Exchange>>,
+    /// The turn in flight, worded as the model was given it.
+    asked: RefCell<String>,
+    reply: gtk::Box,
+    reply_entry: gtk::Entry,
     heading: gtk::Label,
     spinner: gtk::Spinner,
     status: gtk::Label,
@@ -65,6 +86,9 @@ impl Conversation {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
         root.add_css_class("raven-card");
         root.set_visible(false);
+
+        let history = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        root.append(&history);
 
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let spinner = gtk::Spinner::new();
@@ -101,10 +125,32 @@ impl Conversation {
         view.add_css_class("answer");
         root.append(&view);
 
+        // The reply box appears once there is something to reply to.
+        let reply = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reply.set_visible(false);
+        let reply_entry = gtk::Entry::builder()
+            .placeholder_text("Reply to this answer…")
+            .hexpand(true)
+            .build();
+        reply.append(&reply_entry);
+        let send = gtk::Button::with_label("Reply");
+        reply.append(&send);
+        let fresh = gtk::Button::with_label("New question");
+        fresh.add_css_class("flat");
+        fresh.set_tooltip_text(Some("Forget this conversation and start another"));
+        reply.append(&fresh);
+        root.append(&reply);
+
         let conversation = Rc::new(Conversation {
             app: Rc::downgrade(app),
             page,
             root,
+            history,
+            frozen: Cell::new(0),
+            past: RefCell::new(Vec::new()),
+            asked: RefCell::new(String::new()),
+            reply,
+            reply_entry,
             heading,
             spinner,
             status,
@@ -131,6 +177,36 @@ impl Conversation {
                 app.copy(text.as_str(), "the answer");
             });
         }
+        {
+            let weak = Rc::downgrade(&conversation);
+            let app = app.clone();
+            let entry = conversation.reply_entry.clone();
+            let submit = move || {
+                let Some(c) = weak.upgrade() else {
+                    return;
+                };
+                let question = entry.text().trim().to_string();
+                if question.is_empty() {
+                    entry.grab_focus();
+                    return;
+                }
+                entry.set_text("");
+                c.follow_up(&app, &question);
+            };
+            let activate = submit.clone();
+            conversation
+                .reply_entry
+                .connect_activate(move |_| activate());
+            send.connect_clicked(move |_| submit());
+        }
+        {
+            let weak = Rc::downgrade(&conversation);
+            fresh.connect_clicked(move |_| {
+                if let Some(c) = weak.upgrade() {
+                    c.reset();
+                }
+            });
+        }
         conversation
     }
 
@@ -138,12 +214,59 @@ impl Conversation {
         &self.root
     }
 
-    /// Start an answer. `build` runs on the worker: it gathers whatever part
-    /// of the system the request is about and assembles the conversation.
-    pub fn start<F>(self: &Rc<Self>, app: &Rc<App>, heading: &str, build: F)
+    /// Start a new conversation, forgetting any that was open.
+    ///
+    /// `asked` is the first turn as the model is being given it, which is not
+    /// always what the heading says: a finding shows its title and the model
+    /// is handed the evidence, and it is the evidence a later turn has to
+    /// replay. `build` runs on the worker: it gathers whatever part of the
+    /// system the request is about and assembles the conversation.
+    pub fn start<F>(self: &Rc<Self>, app: &Rc<App>, heading: &str, asked: &str, build: F)
     where
         F: FnOnce(&Config) -> Vec<Message> + Send + 'static,
     {
+        self.reset();
+        self.begin(app, heading, asked, build);
+    }
+
+    /// Continue the conversation that is already open.
+    pub fn follow_up(self: &Rc<Self>, app: &Rc<App>, question: &str) {
+        let past = self.past.borrow().clone();
+        let heading = question.to_string();
+        let question = question.to_string();
+        self.begin(app, &heading, &heading, move |cfg| {
+            // The whole conversation decides what gets read, not the newest
+            // question alone: a follow-up that changes the subject still has
+            // to see what the earlier turns were about.
+            let asked: Vec<&str> = past
+                .iter()
+                .map(|e| e.question.as_str())
+                .chain(std::iter::once(question.as_str()))
+                .collect();
+            let areas = probe::areas_for_conversation(asked);
+            let view = SystemView::gather_for(cfg, &areas, ProbeOptions::default());
+            let findings = diagnose::run(&view);
+            prompt::build_follow_up(&past, &question, &view, &findings, cfg)
+        });
+    }
+
+    /// Forget the conversation and empty the card.
+    pub fn reset(&self) {
+        self.past.borrow_mut().clear();
+        self.frozen.set(0);
+        self.asked.borrow_mut().clear();
+        widgets::clear_box(&self.history);
+        self.buffer.set_text("");
+        self.reply.set_visible(false);
+        self.root.set_visible(false);
+    }
+
+    fn begin<F>(self: &Rc<Self>, app: &Rc<App>, heading: &str, asked: &str, build: F)
+    where
+        F: FnOnce(&Config) -> Vec<Message> + Send + 'static,
+    {
+        self.freeze_finished_turns();
+        *self.asked.borrow_mut() = asked.to_string();
         self.cancel.borrow().store(true, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         *self.cancel.borrow_mut() = cancel.clone();
@@ -251,11 +374,56 @@ impl Conversation {
                 let answer =
                     self.buffer
                         .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false);
+                // Only a finished answer joins the conversation. One that was
+                // stopped or failed is not something to hold the model to on
+                // the next turn.
+                let asked = self.asked.borrow().clone();
+                if !asked.is_empty() && !answer.trim().is_empty() {
+                    self.past
+                        .borrow_mut()
+                        .push(Exchange::new(asked, answer.to_string()));
+                    self.reply.set_visible(true);
+                }
                 Some(notify::report(&heading, false, &answer))
             }
         };
         app.answer_ended(self.page, report);
     }
+}
+
+impl Conversation {
+    /// Move answered turns out of the live view and into the history above
+    /// it, so the card reads as one conversation rather than one answer.
+    fn freeze_finished_turns(&self) {
+        let past = self.past.borrow();
+        for e in &past[self.frozen.get().min(past.len())..] {
+            self.history.append(&finished_turn(e));
+        }
+        self.frozen.set(past.len());
+    }
+}
+
+/// A turn that is over: what was asked, and what came back.
+fn finished_turn(exchange: &Exchange) -> gtk::Box {
+    let turn = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    turn.add_css_class("past-turn");
+
+    let question = gtk::Label::new(Some(exchange.headline()));
+    question.add_css_class("turn-question");
+    question.set_xalign(0.0);
+    question.set_wrap(true);
+    question.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    turn.append(&question);
+
+    let answer = gtk::Label::new(Some(exchange.answer.trim()));
+    answer.add_css_class("answer");
+    answer.set_xalign(0.0);
+    answer.set_wrap(true);
+    answer.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    answer.set_selectable(true);
+    turn.append(&answer);
+
+    turn
 }
 
 /// The worker: gather, ask, forward tokens until done or told to stop.

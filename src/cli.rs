@@ -57,6 +57,8 @@ pub struct AskArgs {
     pub dry_run: bool,
     pub areas: Vec<Area>,
     pub online: bool,
+    /// Answer once and exit, rather than staying for follow-up questions.
+    pub once: bool,
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +66,8 @@ pub struct ExplainArgs {
     /// Empty means read stdin.
     pub text: String,
     pub dry_run: bool,
+    /// Answer once and exit, rather than staying for follow-up questions.
+    pub once: bool,
 }
 
 #[derive(Debug)]
@@ -185,6 +189,7 @@ fn parse_ask<I: Iterator<Item = String>>(it: I) -> Result<AskArgs, String> {
         match arg.as_str() {
             "--dry-run" => a.dry_run = true,
             "--online" => a.online = true,
+            "--once" => a.once = true,
             "--area" => {
                 let v = it.next().ok_or("--area needs a name")?;
                 a.areas.push(parse_area(&v)?);
@@ -206,6 +211,7 @@ fn parse_explain<I: Iterator<Item = String>>(it: I) -> Result<ExplainArgs, Strin
     for arg in it {
         match arg.as_str() {
             "--dry-run" => e.dry_run = true,
+            "--once" => e.once = true,
             // `-` is the conventional way to say "read stdin".
             "-" => {}
             other => words.push(other.to_string()),
@@ -320,7 +326,17 @@ DOCTOR OPTIONS
 ASK OPTIONS
   --area <name>                     limit what gets read. Repeatable.
   --online                          permit checks that use the network
+  --once                            answer once instead of staying for
+                                    follow-up questions
   --dry-run                         print the prompt instead of sending it
+
+FOLLOW-UP QUESTIONS
+  `ask` and `explain` stay open for follow-ups when they are run in a
+  terminal, because one answer is rarely the end of it. Press Enter on an
+  empty line, or Ctrl-D, to leave. The machine is read again before each
+  answer, so 'did that fix it?' is a question Oracle can actually see the
+  answer to. Piped or redirected, both answer once and exit, and `--once`
+  says so explicitly.
 
 GLOBAL OPTIONS
   --plain                           no colour, no decoration
@@ -394,6 +410,35 @@ mod tests {
                 "{promise:?} is not intact on one line of the help text"
             );
         }
+    }
+
+    #[test]
+    fn a_question_stays_for_follow_ups_unless_told_otherwise() {
+        let Command::Ask(a) = p(&["ask", "why is it slow"]).unwrap().command else {
+            panic!("expected ask");
+        };
+        assert!(
+            !a.once,
+            "a question in a terminal is the start of a conversation"
+        );
+
+        let Command::Ask(a) = p(&["ask", "--once", "why is it slow"]).unwrap().command else {
+            panic!("expected ask");
+        };
+        assert!(a.once);
+        assert_eq!(
+            a.question, "why is it slow",
+            "--once is not part of the question"
+        );
+    }
+
+    #[test]
+    fn explain_takes_once_too() {
+        let Command::Explain(e) = p(&["explain", "--once", "error: nope"]).unwrap().command else {
+            panic!("expected explain");
+        };
+        assert!(e.once);
+        assert_eq!(e.text, "error: nope");
     }
 
     #[test]

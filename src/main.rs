@@ -207,7 +207,7 @@ fn explain_findings(view: &SystemView, findings: &[probe::Finding], cfg: &Config
     let messages = prompt::build_report_summary(findings, view, cfg);
     println!();
     match stream_answer(&messages, cfg) {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(e) => report_model_error(&e, cfg),
     }
 }
@@ -262,7 +262,13 @@ fn ask(args: AskArgs, cfg: &Config) -> i32 {
     }
 
     match stream_answer(&messages, cfg) {
-        Ok(()) => 0,
+        Ok(answer) => {
+            if interactive() && !args.once {
+                let mut past = vec![prompt::Exchange::new(args.question.clone(), answer)];
+                follow_ups(&mut past, opts, cfg);
+            }
+            0
+        }
         Err(e) => {
             if findings.is_empty() {
                 report_model_error(&e, cfg);
@@ -318,7 +324,18 @@ fn explain(args: ExplainArgs, cfg: &Config) -> i32 {
     }
 
     match stream_answer(&messages, cfg) {
-        Ok(()) => 0,
+        Ok(answer) => {
+            // Only when the error arrived as an argument. Reading it from a
+            // pipe leaves stdin at EOF, so there is nobody left to ask.
+            if interactive() && !args.once {
+                let mut past = vec![prompt::Exchange::new(
+                    prompt::pasted_error(&text, cfg),
+                    answer,
+                )];
+                follow_ups(&mut past, ProbeOptions::default(), cfg);
+            }
+            0
+        }
         Err(e) => {
             report_model_error(&e, cfg);
             // Fall back to the rules: they may well have found the cause.
@@ -786,7 +803,10 @@ fn has_model(cfg: &Config) -> bool {
 }
 
 /// Send a conversation and print the reply as it arrives.
-fn stream_answer(messages: &[model::Message], cfg: &Config) -> Result<(), ModelError> {
+///
+/// The reply is also returned, because a conversation that continues has to
+/// send back what the model already said.
+fn stream_answer(messages: &[model::Message], cfg: &Config) -> Result<String, ModelError> {
     let backend = model::backend_for(cfg).map_err(|_| ModelError::NotConfigured)?;
 
     let mut stdout = std::io::stdout();
@@ -808,7 +828,66 @@ fn stream_answer(messages: &[model::Message], cfg: &Config) -> Result<(), ModelE
         let _ = stdout.flush();
     }
 
-    result.map(|_| ())
+    result
+}
+
+// ------------------------------------------------------- follow-up turns
+
+/// Whether this invocation can hold a conversation.
+///
+/// Both ends must be a terminal. A piped `oracle ask` belongs to a script:
+/// reading its stdin would eat input meant for the next command, and writing
+/// a prompt would corrupt what it captured.
+fn interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Keep answering until the person has no more to ask.
+///
+/// The machine is read again before each turn rather than reused from the
+/// first one. Between two turns the person has usually run the thing that was
+/// suggested, and the whole point of the second answer is to know whether it
+/// worked.
+fn follow_ups(past: &mut Vec<prompt::Exchange>, opts: ProbeOptions, cfg: &Config) {
+    println!();
+    ui::note("Ask a follow-up, or press Enter on an empty line to leave.");
+
+    loop {
+        let Some(question) = ui::prompt_line(&format!("\n{} ", ui::cyan("›"))) else {
+            // Ctrl-D leaves the cursor at the end of the prompt line.
+            println!();
+            return;
+        };
+        if question.is_empty() {
+            return;
+        }
+
+        let asked: Vec<&str> = past
+            .iter()
+            .map(|e| e.question.as_str())
+            .chain(std::iter::once(question.as_str()))
+            .collect();
+        let areas = probe::areas_for_conversation(asked);
+        let view = SystemView::gather_for(cfg, &areas, opts);
+        let findings = diagnose::run(&view);
+        let messages = prompt::build_follow_up(past, &question, &view, &findings, cfg);
+
+        println!();
+        match stream_answer(&messages, cfg) {
+            Ok(answer) => past.push(prompt::Exchange::new(question, answer)),
+            Err(e) => {
+                report_model_error(&e, cfg);
+                // A model that has gone away is not coming back inside this
+                // loop; anything else is worth another question.
+                if matches!(
+                    e,
+                    ModelError::NotConfigured | ModelError::Unreachable(_) | ModelError::NoModel(_)
+                ) {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn report_model_error(e: &ModelError, cfg: &Config) {

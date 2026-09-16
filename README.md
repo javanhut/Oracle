@@ -7,8 +7,8 @@ wrong, and suggests what to try. It runs when you run it and at no other time.
 raven-oracle                                # the desktop app, also in the launcher
 oracle tui                                  # the full-screen terminal interface
 oracle doctor                               # the same findings as plain text
-oracle ask "why can't I install anything"
-rvn install foo 2>&1 | oracle explain
+oracle ask "why can't I install anything"    # then keep asking; Enter to leave
+rvn install foo 2>&1 | oracle explain        # piped, so it answers once
 ```
 
 ## It is not part of Raven Linux
@@ -64,6 +64,20 @@ part of the system the question is about, hands it to a model on this machine,
 and prints the answer. The findings come first regardless, because they are
 certain and the model's paragraph is not.
 
+**Keeps answering.** One answer is rarely the end of a problem: you try the
+suggestion, something else happens, and the next thing you want to say is
+"that printed this instead". So `ask` and `explain` stay open for follow-ups
+when they are run in a terminal, and both interfaces have a reply box under the
+answer. Press Enter on an empty line, or Ctrl-D, to leave; `--once` answers
+once and exits, and a piped or redirected `oracle ask` does that anyway.
+
+Every turn reads the machine again before it asks, so the context the model
+gets describes the system as it is at that moment rather than as it was before
+you tried anything — which is what makes "did that fix it?" a question Oracle
+can actually answer. The reading is attached to the newest question only. A
+conversation therefore costs about the same per turn as the first one did, and
+the model is never shown two disagreeing descriptions of the same machine.
+
 **Takes dictation, if you set it up.** Optional, off by default, covered below.
 
 ## The desktop app
@@ -77,8 +91,8 @@ from `~/.config/raven/desktop.toml`.
 |---|---|
 | Overview | The verdict, counts by severity, the machine, and how Oracle behaves |
 | Findings | Worst first, each with what Oracle saw and what to try. Copy a command; ask the model to explain one |
-| Ask | A question about this machine, answered by the local model as it streams |
-| Explain an Error | Paste what a failed command printed and get told what it means |
+| Ask | A question about this machine, answered by the local model as it streams. Reply under the answer to keep going; *New question* starts over |
+| Explain an Error | Paste what a failed command printed and get told what it means, then ask about the answer |
 | What a Model Sees | The exact text a model would be given, before anything is sent |
 | Settings | The model, what Oracle may read, privacy, and *Forget Everything* |
 
@@ -123,8 +137,9 @@ the selected finding's evidence and suggested steps on the right.
 | `↑` `↓` `j` `k` | Move the selection. `tab` swaps panes so you can scroll the detail |
 | `f` | Cycle the filter: everything, warnings and worse, critical only |
 | `r` | Check the machine again |
-| `a` | Ask a question. The answer streams in as the model produces it |
-| `e` | Have the model explain the selected finding |
+| `a` | Ask a question. The answer streams in as the model produces it, and the next question continues the same conversation |
+| `ctrl-n` | Start a new conversation, forgetting the one on screen |
+| `e` | Have the model explain the selected finding. A finding starts a conversation of its own |
 | `y` | Copy that finding's command to the clipboard |
 | `?` | Keys |
 | `esc` | Back, or stop an answer mid-stream |
@@ -187,8 +202,8 @@ imlazy uninstall        # removes the binaries, launcher entry and icon
 | `raven-oracle` | The desktop app. `--page <id>` opens on a page |
 | `oracle tui` | The full-screen terminal interface |
 | `oracle doctor` | Check the machine and report |
-| `oracle ask "…"` | Ask about this machine |
-| `oracle explain` | Explain an error you paste or pipe in |
+| `oracle ask "…"` | Ask about this machine, and follow up. `--once` answers once |
+| `oracle explain` | Explain an error you paste or pipe in, and follow up |
 | `oracle context` | Show exactly what would be sent to a model |
 | `oracle status` | What is configured and what is missing |
 | `oracle setup` | Configure it. Optional; the defaults work |
@@ -296,7 +311,10 @@ HTTPS changes how the bytes travel, not where Oracle may send them: an
 `https://` address off this machine is refused exactly as an `http://` one is.
 
 Nothing is logged. History is off by default, so Oracle does not accumulate a
-record of your problems unless you ask it to.
+record of your problems unless you ask it to. A conversation lives in memory
+for as long as the command is running or the window is open, and goes when it
+does: nothing about a follow-up is written down, and closing the app is enough
+to forget it.
 
 ## Configuration
 

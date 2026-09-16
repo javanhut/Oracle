@@ -1,8 +1,16 @@
 //! Building what the model sees.
 //!
-//! Two jobs. Turn a `SystemView` into a compact description of the machine,
-//! and give the model instructions that keep it useful rather than
-//! enthusiastic.
+//! Three jobs. Turn a `SystemView` into a compact description of the machine,
+//! give the model instructions that keep it useful rather than enthusiastic,
+//! and carry a conversation forward when one answer was not enough.
+//!
+//! Troubleshooting is rarely one question. The person tries the suggestion,
+//! it half works, and the next thing they say is "that printed something
+//! else". So a turn is assembled from the transcript so far plus the machine
+//! as it is *now*: the context block is attached to the newest question only
+//! and re-read before every turn, which keeps the token cost flat across a
+//! long conversation and means the model sees the state after the last thing
+//! the person ran rather than the state before it.
 //!
 //! The instructions matter more than they look. A small local model asked an
 //! open question about a Linux system will confidently invent a systemd unit
@@ -41,6 +49,19 @@ pub fn system_prompt(view: &SystemView) -> String {
          - Say \"I don't know from what I can see here\" when that is the truth. It is a good \
            answer.\n\
          - Be brief. Three short paragraphs at most, fewer if the answer is simple.\n\n",
+    );
+
+    p.push_str(
+        "This can take more than one turn:\n\
+         - The person can reply after your answer. Earlier turns are the same conversation, so \
+           do not start again from nothing or repeat an answer you have already given.\n\
+         - The system context is re-read before every turn. If it now disagrees with something \
+           you said earlier, the context is right and you were working from an older reading.\n\
+         - If they paste what a command printed, that is fresh evidence about this machine. \
+           Trust it over your own guess.\n\
+         - If they say your suggestion did not work, do not suggest it again. Ask for the output \
+           that proves what happened, or try a different explanation.\n\
+         - Do not end with an offer to help further. They will ask if they want more.\n\n",
     );
 
     p.push_str(
@@ -317,6 +338,86 @@ pub fn findings_context(findings: &[Finding]) -> String {
     s
 }
 
+/// One finished turn: what the person said, and what the model said back.
+///
+/// The question is stored in the person's own voice rather than in the
+/// wrapper the model was sent, because on a later turn the role already says
+/// who was speaking and the wrapper only adds noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exchange {
+    pub question: String,
+    pub answer: String,
+}
+
+impl Exchange {
+    pub fn new(question: impl Into<String>, answer: impl Into<String>) -> Exchange {
+        Exchange {
+            question: question.into(),
+            answer: answer.into(),
+        }
+    }
+
+    /// One line naming this turn, for a transcript on screen.
+    ///
+    /// A typed question is already one line. A pasted error or a finding is
+    /// not, and its first line is the part the person will recognise.
+    pub fn headline(&self) -> &str {
+        self.question
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+    }
+}
+
+/// How many past turns are replayed.
+///
+/// A small local model given a long transcript starts answering the question
+/// it was asked four turns ago. Six turns is more than most troubleshooting
+/// takes and still leaves room for the context block, which is the part that
+/// has to survive.
+const MAX_PAST: usize = 6;
+
+/// Assemble one turn: the transcript so far, then the newest question with
+/// the machine attached to it.
+///
+/// `preamble` is everything that goes in front of the new question -- the
+/// context block, and whatever framing the caller wants. Past turns are sent
+/// bare, since they have already been answered and their context is spent.
+pub fn build_turn(
+    past: &[Exchange],
+    preamble: &str,
+    pending: &str,
+    view: &SystemView,
+) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(past.len() * 2 + 2);
+    messages.push(Message::system(system_prompt(view)));
+
+    let dropped = past.len().saturating_sub(MAX_PAST);
+    for e in &past[dropped..] {
+        messages.push(Message::user(e.question.clone()));
+        messages.push(Message::assistant(e.answer.clone()));
+    }
+
+    let elision = if dropped > 0 {
+        "Earlier turns in this conversation have been left out to save room. If you need \
+         something from them, ask for it again.\n\n"
+    } else {
+        ""
+    };
+    messages.push(Message::user(format!("{elision}{preamble}{pending}")));
+    messages
+}
+
+/// The context block that goes in front of a new question.
+fn preamble(view: &SystemView, findings: Option<&[Finding]>, cfg: &Config) -> String {
+    let context = system_context(view, cfg);
+    match findings {
+        Some(f) => format!("System context:\n\n{context}\n{}\n", findings_context(f)),
+        None => format!("System context:\n\n{context}\n"),
+    }
+}
+
 /// Assemble the conversation for a question.
 pub fn build(
     question: &str,
@@ -324,39 +425,68 @@ pub fn build(
     findings: &[Finding],
     cfg: &Config,
 ) -> Vec<Message> {
-    let context = system_context(view, cfg);
-    let checks = findings_context(findings);
+    build_turn(
+        &[],
+        &preamble(view, Some(findings), cfg),
+        &format!("The person at this machine asks:\n\n{question}"),
+        view,
+    )
+}
 
-    vec![
-        Message::system(system_prompt(view)),
-        Message::user(format!(
-            "System context:\n\n{context}\n{checks}\n\
-             The person at this machine asks:\n\n{question}"
-        )),
-    ]
+/// Assemble the next turn of a conversation that is already going.
+///
+/// The machine has been read again by the time this is called, which is the
+/// point: between one turn and the next the person may well have run the
+/// thing that was suggested.
+pub fn build_follow_up(
+    past: &[Exchange],
+    question: &str,
+    view: &SystemView,
+    findings: &[Finding],
+    cfg: &Config,
+) -> Vec<Message> {
+    let preamble = format!(
+        "{}The context above was read again just now, after your last answer, so it shows this \
+         machine as it is at this moment.\n\n",
+        preamble(view, Some(findings), cfg)
+    );
+    build_turn(
+        past,
+        &preamble,
+        &format!("The person at this machine replies:\n\n{question}"),
+        view,
+    )
 }
 
 /// Assemble the conversation for explaining an error someone pasted or piped
 /// in.
 pub fn build_explain(error_text: &str, view: &SystemView, cfg: &Config) -> Vec<Message> {
-    let context = system_context(view, cfg);
+    build_turn(
+        &[],
+        &preamble(view, None, cfg),
+        &format!(
+            "{}\n\n\
+             Explain what this error means and what is most likely causing it on this machine. \
+             Then give the smallest next step. If the output does not contain enough to be sure, \
+             say what else you would need to see.",
+            pasted_error(error_text, cfg)
+        ),
+        view,
+    )
+}
+
+/// A pasted error in the person's own voice, for the transcript.
+///
+/// Redaction happens here rather than at the call site so that what is stored
+/// and replayed on later turns is the same scrubbed text the model was sent
+/// the first time.
+pub fn pasted_error(error_text: &str, cfg: &Config) -> String {
     let error_text = if cfg.privacy.redact {
         crate::redact::scrub(error_text)
     } else {
         error_text.to_string()
     };
-
-    vec![
-        Message::system(system_prompt(view)),
-        Message::user(format!(
-            "System context:\n\n{context}\n\
-             The person at this machine ran something that failed, and pasted the output:\n\n\
-             ---\n{error_text}\n---\n\n\
-             Explain what this error means and what is most likely causing it on this machine. \
-             Then give the smallest next step. If the output does not contain enough to be sure, \
-             say what else you would need to see."
-        )),
-    ]
+    format!("I ran something that failed, and this is what it printed:\n\n---\n{error_text}\n---")
 }
 
 /// Assemble a request to expand on a single finding.
@@ -372,10 +502,24 @@ pub fn build_finding_explanation(
     view: &SystemView,
     cfg: &Config,
 ) -> Vec<Message> {
-    let context = system_context(view, cfg);
+    build_turn(
+        &[],
+        &preamble(view, None, cfg),
+        &format!(
+            "{}\n\n\
+             Explain to the person at this machine what this means for them in practice, what \
+             to check before acting, and anything that could go wrong with the suggested step. \
+             Do not repeat the evidence back to them. Two short paragraphs at most.",
+            finding_as_question(finding)
+        ),
+        view,
+    )
+}
 
+/// A finding in the person's own voice, for the transcript.
+pub fn finding_as_question(finding: &Finding) -> String {
     let mut detail = format!(
-        "Finding: {}\nSeverity: {}\n",
+        "A check on this machine reported: {}\n\nSeverity: {}\n",
         finding.title,
         finding.severity.label()
     );
@@ -395,34 +539,20 @@ pub fn build_finding_explanation(
             detail.push('\n');
         }
     }
-
-    vec![
-        Message::system(system_prompt(view)),
-        Message::user(format!(
-            "System context:\n\n{context}\n\
-             An automated check on this machine produced the following.\n\n{detail}\n\
-             Explain to the person at this machine what this means for them in practice, what \
-             to check before acting, and anything that could go wrong with the suggested step. \
-             Do not repeat the evidence back to them. Two short paragraphs at most."
-        )),
-    ]
+    detail
 }
 
 /// Assemble a request to narrate a `doctor` report.
 pub fn build_report_summary(findings: &[Finding], view: &SystemView, cfg: &Config) -> Vec<Message> {
-    let context = system_context(view, cfg);
-    let checks = findings_context(findings);
-
-    vec![
-        Message::system(system_prompt(view)),
-        Message::user(format!(
-            "System context:\n\n{context}\n{checks}\n\
-             Write a short plain-language summary for the person at this machine: what is worth \
-             their attention, in what order, and what is safe to ignore. Do not repeat the list \
-             back to them. Two short paragraphs at most. If nothing needs attention, say so in \
-             one sentence."
-        )),
-    ]
+    build_turn(
+        &[],
+        &preamble(view, Some(findings), cfg),
+        "Write a short plain-language summary for the person at this machine: what is worth \
+         their attention, in what order, and what is safe to ignore. Do not repeat the list \
+         back to them. Two short paragraphs at most. If nothing needs attention, say so in \
+         one sentence.",
+        view,
+    )
 }
 
 #[cfg(test)]
@@ -536,6 +666,80 @@ mod tests {
         assert!(body.contains("1G free of 100G"));
         assert!(body.contains("du -sh /"));
         assert!(body.contains("could go wrong"));
+    }
+
+    #[test]
+    fn a_follow_up_replays_the_conversation_as_user_and_assistant_turns() {
+        use crate::model::Role;
+        let cfg = Config::default();
+        let past = vec![
+            Exchange::new("why is it slow", "swap is thrashing"),
+            Exchange::new("how do I stop that", "close the browser"),
+        ];
+        let msgs = build_follow_up(&past, "did that work", &raven_view(), &[], &cfg);
+
+        let roles: Vec<&Role> = msgs.iter().map(|m| &m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                &Role::System,
+                &Role::User,
+                &Role::Assistant,
+                &Role::User,
+                &Role::Assistant,
+                &Role::User
+            ]
+        );
+        assert_eq!(msgs[1].content, "why is it slow");
+        assert_eq!(msgs[2].content, "swap is thrashing");
+        assert!(msgs.last().unwrap().content.contains("did that work"));
+    }
+
+    #[test]
+    fn only_the_newest_turn_carries_the_machine() {
+        // The context block is the expensive part. Repeating it every turn
+        // would crowd out the conversation on a small model, and the older
+        // copies would be stale anyway.
+        let cfg = Config::default();
+        let past = vec![Exchange::new("why is it slow", "swap is thrashing")];
+        let msgs = build_follow_up(&past, "did that work", &raven_view(), &[], &cfg);
+
+        assert!(!msgs[1].content.contains("=== This machine ==="));
+        let newest = &msgs.last().unwrap().content;
+        assert!(newest.contains("=== This machine ==="));
+        assert!(
+            newest.contains("read again just now"),
+            "the model has to know the reading is current, or it will answer from the first one"
+        );
+    }
+
+    #[test]
+    fn a_long_conversation_is_cut_down_and_the_model_is_told_it_was() {
+        let cfg = Config::default();
+        let past: Vec<Exchange> = (0..MAX_PAST + 3)
+            .map(|i| Exchange::new(format!("question {i}"), format!("answer {i}")))
+            .collect();
+        let msgs = build_follow_up(&past, "and now", &raven_view(), &[], &cfg);
+
+        assert_eq!(msgs.len(), MAX_PAST * 2 + 2);
+        assert_eq!(msgs[1].content, "question 3", "the oldest turns go first");
+        assert!(msgs.last().unwrap().content.contains("left out"));
+    }
+
+    #[test]
+    fn a_turn_is_named_on_screen_by_its_first_real_line() {
+        let cfg = Config::default();
+        assert_eq!(
+            Exchange::new("why is it slow", "").headline(),
+            "why is it slow"
+        );
+        // A pasted error is many lines; the first one is what the person will
+        // recognise in a transcript.
+        let pasted = Exchange::new(pasted_error("error: db is locked\n  at line 4", &cfg), "");
+        assert_eq!(
+            pasted.headline(),
+            "I ran something that failed, and this is what it printed:"
+        );
     }
 
     #[test]

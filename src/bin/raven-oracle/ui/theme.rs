@@ -79,6 +79,15 @@ image.sev-note, label.sev-note { color: @accent_bg_color; }
 }
 .text-well text, .text-well textview { background-color: transparent; }
 textview.answer, textview.answer text { background-color: transparent; font-size: 14px; }
+label.answer { font-size: 14px; }
+
+/* A turn of the conversation that is already answered. */
+.past-turn {
+  border-left: 2px solid alpha(#ffffff, 0.14);
+  padding-left: 12px;
+  opacity: 0.85;
+}
+.turn-question { font-weight: 700; }
 
 .promise image { color: @success_color; }
 .promise image.warning { color: @warning_color; }
@@ -87,7 +96,8 @@ textview.answer, textview.answer text { background-color: transparent; font-size
 
 const LIGHT_CSS: &str = concat!(
     include_str!("../../../../data/raven-glass-light.css"),
-    ".command, .text-well { background-color: alpha(#000000, 0.05); border-color: alpha(#000000, 0.08); }\n"
+    ".command, .text-well { background-color: alpha(#000000, 0.05); border-color: alpha(#000000, 0.08); }\n",
+    ".past-turn { border-left-color: alpha(#000000, 0.14); }\n"
 );
 
 /// The shared sheet and Oracle's classes in one provider; the accent and the

@@ -23,6 +23,9 @@ use crate::config::Config;
 pub enum Role {
     System,
     User,
+    /// What the model said last time. Troubleshooting rarely ends in one
+    /// answer, so a reply is sent back as part of the next question.
+    Assistant,
 }
 
 impl Role {
@@ -30,6 +33,7 @@ impl Role {
         match self {
             Role::System => "system",
             Role::User => "user",
+            Role::Assistant => "assistant",
         }
     }
 }
@@ -50,6 +54,12 @@ impl Message {
     pub fn user(c: impl Into<String>) -> Message {
         Message {
             role: Role::User,
+            content: c.into(),
+        }
+    }
+    pub fn assistant(c: impl Into<String>) -> Message {
+        Message {
+            role: Role::Assistant,
             content: c.into(),
         }
     }

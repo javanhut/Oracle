@@ -21,6 +21,7 @@ mod draw;
 use crate::config::Config;
 use crate::diagnose;
 use crate::probe::{Finding, ProbeOptions, SystemView};
+use crate::prompt::Exchange;
 use app::{Action, App, Event, Task};
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -90,9 +91,9 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, cfg: &Config) -> std::io:
                     spawn_scan(cfg.clone(), tx.clone());
                     app.handle_event(Event::ScanStarted);
                 }
-                Task::Ask(question) => {
+                Task::Ask { question, past } => {
                     generation += 1;
-                    spawn_ask(cfg.clone(), question, tx.clone(), generation);
+                    spawn_ask(cfg.clone(), question, past, tx.clone(), generation);
                 }
                 Task::Explain(finding) => {
                     generation += 1;
@@ -146,6 +147,11 @@ fn action_for(key: KeyEvent, app: &App) -> Action {
         return Action::Quit;
     }
 
+    // Ctrl-N puts the conversation behind you without leaving the screen.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+        return Action::NewConversation;
+    }
+
     let typing = app.view == app::View::Ask;
 
     match key.code {
@@ -189,12 +195,33 @@ fn spawn_scan(cfg: Config, tx: Sender<Event>) {
     });
 }
 
-fn spawn_ask(cfg: Config, question: String, tx: Sender<Event>, _generation: u64) {
+/// Ask, with whatever has already been asked.
+///
+/// The machine is read again for every turn, and for the whole conversation
+/// rather than the newest question alone: a follow-up usually lands after the
+/// person has tried something, and "is it fixed?" is only answerable from a
+/// fresh reading.
+fn spawn_ask(
+    cfg: Config,
+    question: String,
+    past: Vec<Exchange>,
+    tx: Sender<Event>,
+    _generation: u64,
+) {
     std::thread::spawn(move || {
-        let areas = crate::probe::areas_for_question(&question);
+        let asked: Vec<&str> = past
+            .iter()
+            .map(|e| e.question.as_str())
+            .chain(std::iter::once(question.as_str()))
+            .collect();
+        let areas = crate::probe::areas_for_conversation(asked);
         let view = SystemView::gather_for(&cfg, &areas, ProbeOptions::default());
         let findings = diagnose::run(&view);
-        let messages = crate::prompt::build(&question, &view, &findings, &cfg);
+        let messages = if past.is_empty() {
+            crate::prompt::build(&question, &view, &findings, &cfg)
+        } else {
+            crate::prompt::build_follow_up(&past, &question, &view, &findings, &cfg)
+        };
         stream(cfg, messages, tx);
     });
 }

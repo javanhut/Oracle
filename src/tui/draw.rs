@@ -247,26 +247,59 @@ pub fn detail_lines(f: &Finding) -> Vec<Line<'static>> {
 fn ask(frame: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
 
+    let cyan = Style::default().fg(Color::Cyan);
+    let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line> = Vec::new();
-    if !app.question.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("? ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                app.question.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
+
+    let turn = |lines: &mut Vec<Line>, question: &str, answer: &str| {
+        if !question.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("? ", cyan),
+                Span::styled(
+                    question.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+        }
+        for line in answer.lines() {
+            lines.push(Line::raw(line.to_string()));
+        }
+    };
+
+    // What has already been answered, oldest first, so a follow-up reads as
+    // the continuation it is.
+    for (i, e) in app.transcript.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("─".repeat(3), dim)));
+            lines.push(Line::raw(""));
+        }
+        turn(&mut lines, e.headline(), &e.answer);
+    }
+
+    let live = !app.question.is_empty() || !app.answer.is_empty();
+    if live && !app.transcript.is_empty() {
         lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("─".repeat(3), dim)));
+        lines.push(Line::raw(""));
+    }
+    if live {
+        turn(&mut lines, &app.question, &app.answer);
     }
 
     match &app.answer_state {
+        Answer::Idle if app.transcript.is_empty() => lines.push(Line::from(Span::styled(
+            "Type a question about this machine and press Enter.",
+            dim,
+        ))),
         Answer::Idle => lines.push(Line::from(Span::styled(
-            "Type a question about this machine and press Enter.\n",
-            Style::default().fg(Color::DarkGray),
+            "Ask a follow-up, or ctrl-n to start a new conversation.",
+            dim,
         ))),
         Answer::Working if app.answer.is_empty() => lines.push(Line::from(Span::styled(
             "Reading the system, then asking the local model…",
-            Style::default().fg(Color::DarkGray),
+            dim,
         ))),
         Answer::Failed(e) => {
             lines.push(Line::from(Span::styled(
@@ -277,35 +310,62 @@ fn ask(frame: &mut Frame, area: Rect, app: &App) {
         _ => {}
     }
 
-    for line in app.answer.lines() {
-        lines.push(Line::raw(line.to_string()));
+    if app.answer_state == Answer::Streaming {
+        lines.push(Line::from(Span::styled("▌", cyan)));
     }
 
-    if app.answer_state == Answer::Streaming {
-        lines.push(Line::from(Span::styled(
-            "▌",
-            Style::default().fg(Color::Cyan),
-        )));
-    }
+    // Keep the newest words on screen while they arrive, and stop doing that
+    // the moment the person scrolls up to read something older.
+    let inner = rows[0].width.saturating_sub(2).max(1);
+    let height = rows[0].height.saturating_sub(2);
+    let drawn: usize = lines.iter().map(|l| wrapped_height(l, inner)).sum();
+    let furthest = drawn.saturating_sub(height as usize) as u16;
+    let scroll = if app.follow {
+        furthest
+    } else {
+        app.answer_scroll.min(furthest)
+    };
 
     frame.render_widget(
         Paragraph::new(lines)
             .block(pane_block("answer", false))
             .wrap(Wrap { trim: false })
-            .scroll((app.answer_scroll, 0)),
+            .scroll((scroll, 0)),
         rows[0],
     );
 
+    let prompt = if app.transcript.is_empty() {
+        "› "
+    } else {
+        "↳ "
+    };
     let input = Paragraph::new(Line::from(vec![
-        Span::styled("› ", Style::default().fg(Color::Cyan)),
+        Span::styled(prompt, cyan),
         Span::raw(app.input.clone()),
     ]))
-    .block(pane_block("ask", true));
+    .block(pane_block(
+        if app.transcript.is_empty() {
+            "ask"
+        } else {
+            "follow up"
+        },
+        true,
+    ));
     frame.render_widget(input, rows[1]);
 
     // A real cursor, so typing feels like typing.
     let x = rows[1].x + 3 + app.cursor as u16;
     frame.set_cursor_position((x.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
+}
+
+/// How many rows a line will take once wrapped.
+///
+/// An estimate: it counts characters rather than measuring words, so a line
+/// broken early sits a row short of where this says. Close enough to keep a
+/// streaming answer at the bottom of the pane, which is all it is for.
+fn wrapped_height(line: &Line, width: u16) -> usize {
+    let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    chars.div_ceil(width.max(1) as usize).max(1)
 }
 
 fn status(frame: &mut Frame, area: Rect, app: &App) {
@@ -326,7 +386,9 @@ fn status(frame: &mut Frame, area: Rect, app: &App) {
         View::Report => {
             "  ↑↓ move · tab pane · y copy command · e explain · a ask · f filter · r recheck · ? help · q quit"
         }
-        View::Ask => "  enter send · esc stop, again to go back · ↑↓ scroll · ? help",
+        View::Ask => {
+            "  enter send · ctrl-n new conversation · esc stop, again to go back · ↑↓ scroll · ? help"
+        }
         View::Help => "  any key closes this",
     };
     frame.render_widget(
@@ -361,6 +423,7 @@ fn help_overlay(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled("Doing something", bold)),
         Line::raw("  r           check the machine again"),
         Line::raw("  a           ask a question"),
+        Line::raw("  ctrl-n      start the conversation over"),
         Line::raw("  e           have the model explain this finding"),
         Line::raw("  y           copy this finding's command"),
         Line::raw(""),

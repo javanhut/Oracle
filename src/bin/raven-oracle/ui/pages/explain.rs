@@ -71,7 +71,8 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
                 app.toast("Paste an error first");
                 return;
             }
-            conversation.start(&app, "What that error means", move |cfg| {
+            let asked = prompt::pasted_error(&text, &app.state.borrow().config);
+            conversation.start(&app, "What that error means", &asked, move |cfg| {
                 // Guess the subject from the error itself, the same way a
                 // question is narrowed.
                 let areas = probe::areas_for_question(&text);

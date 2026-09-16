@@ -231,7 +231,7 @@ impl App {
         };
         self.navigate("ask");
         let q = question.to_string();
-        conversation.start(self, question, move |cfg| {
+        conversation.start(self, question, question, move |cfg| {
             // Only the parts of the system the question is about, so the
             // model is told no more about the machine than it needs.
             let areas = probe::areas_for_question(&q);
@@ -249,7 +249,8 @@ impl App {
         self.navigate("ask");
         let finding = finding.clone();
         let heading = format!("About: {}", finding.title);
-        conversation.start(self, &heading, move |cfg| {
+        let asked = prompt::finding_as_question(&finding);
+        conversation.start(self, &heading, &asked, move |cfg| {
             let view = SystemView::gather(cfg, ProbeOptions::default());
             prompt::build_finding_explanation(&finding, &view, cfg)
         });

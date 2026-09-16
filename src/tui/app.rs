@@ -11,6 +11,7 @@
 //! up in front of a user.
 
 use crate::probe::{Finding, Severity};
+use crate::prompt::Exchange;
 
 /// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +94,11 @@ pub struct Notice {
 pub enum Task {
     /// Re-run the probes and the rules.
     Rescan,
-    /// Send a question to the model.
-    Ask(String),
+    /// Send a question to the model, with the conversation it belongs to.
+    Ask {
+        question: String,
+        past: Vec<Exchange>,
+    },
     /// Ask the model to expand on one finding.
     Explain(Finding),
     /// Put text on the clipboard. This is the only thing the interface ever
@@ -122,6 +126,8 @@ pub enum Action {
     /// Leave the current screen, or clear what is on it.
     Back,
     Submit,
+    /// Forget the conversation so far and start a new one.
+    NewConversation,
     Insert(char),
     Backspace,
     CursorLeft,
@@ -155,10 +161,23 @@ pub struct App {
 
     pub input: String,
     pub cursor: usize,
+    /// The question on screen, as the person would recognise it.
     pub question: String,
+    /// The same turn as the model was given it. For a question these are the
+    /// same string; for a finding the screen shows a title and the model was
+    /// given the evidence, and it is the second that has to go into the
+    /// transcript.
+    pub asked: String,
     pub answer: String,
+    /// Finished turns, oldest first. Troubleshooting is rarely one question,
+    /// so the next one is asked with these behind it.
+    pub transcript: Vec<Exchange>,
     pub answer_state: Answer,
     pub answer_scroll: u16,
+    /// Whether the pane stays at the newest words. True until the person
+    /// scrolls up, because reading something older while an answer streams in
+    /// should not be a fight with the scroll position.
+    pub follow: bool,
 
     pub notice: Option<Notice>,
     pub should_quit: bool,
@@ -181,9 +200,12 @@ impl App {
             input: String::new(),
             cursor: 0,
             question: String::new(),
+            asked: String::new(),
             answer: String::new(),
+            transcript: Vec::new(),
             answer_state: Answer::Idle,
             answer_scroll: 0,
+            follow: true,
             notice: None,
             should_quit: false,
             model_available,
@@ -298,12 +320,26 @@ impl App {
                     return None;
                 }
                 self.question = q.clone();
+                self.asked = q.clone();
                 self.input.clear();
                 self.cursor = 0;
                 self.answer.clear();
-                self.answer_scroll = 0;
                 self.answer_state = Answer::Working;
-                return Some(Task::Ask(q));
+                // A new answer belongs at the bottom of the transcript, and
+                // that is where the pane should be looking.
+                self.follow = true;
+                return Some(Task::Ask {
+                    question: q,
+                    past: self.transcript.clone(),
+                });
+            }
+
+            Action::NewConversation => {
+                if self.transcript.is_empty() && self.answer.is_empty() {
+                    return None;
+                }
+                self.start_over();
+                self.notify("new conversation");
             }
 
             Action::Insert(c) => {
@@ -325,10 +361,10 @@ impl App {
             Action::Home => self.cursor = 0,
             Action::End => self.cursor = self.input.chars().count(),
 
-            Action::Up => self.answer_scroll = self.answer_scroll.saturating_sub(1),
-            Action::Down => self.answer_scroll = self.answer_scroll.saturating_add(1),
-            Action::PageUp => self.answer_scroll = self.answer_scroll.saturating_sub(10),
-            Action::PageDown => self.answer_scroll = self.answer_scroll.saturating_add(10),
+            Action::Up => self.scroll_by(-1),
+            Action::Down => self.scroll_by(1),
+            Action::PageUp => self.scroll_by(-10),
+            Action::PageDown => self.scroll_by(10),
 
             _ => {}
         }
@@ -424,9 +460,12 @@ impl App {
                 match self.selected_finding().cloned() {
                     Some(f) => {
                         self.view = View::Ask;
+                        // A finding is a subject of its own, so it starts a
+                        // conversation rather than joining one about
+                        // something else.
+                        self.start_over();
                         self.question = f.title.clone();
-                        self.answer.clear();
-                        self.answer_scroll = 0;
+                        self.asked = crate::prompt::finding_as_question(&f);
                         self.answer_state = Answer::Working;
                         return Some(Task::Explain(f));
                     }
@@ -460,6 +499,16 @@ impl App {
             Event::AnswerFinished => {
                 if matches!(self.answer_state, Answer::Working | Answer::Streaming) {
                     self.answer_state = Answer::Done;
+                    // An answer the person stopped, or one that never
+                    // arrived, is not something to hold the model to later.
+                    if !self.answer.trim().is_empty() && !self.asked.is_empty() {
+                        self.transcript.push(Exchange::new(
+                            std::mem::take(&mut self.asked),
+                            self.answer.clone(),
+                        ));
+                        self.question.clear();
+                        self.answer.clear();
+                    }
                 }
             }
             Event::AnswerFailed(e) => {
@@ -468,6 +517,25 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Scroll the transcript, and stop following the newest words while doing
+    /// it. The next question starts following again; until then the pane
+    /// stays where it was put.
+    fn scroll_by(&mut self, delta: i32) {
+        self.follow = false;
+        self.answer_scroll = self.answer_scroll.saturating_add_signed(delta as i16);
+    }
+
+    /// Drop the conversation and everything on screen with it.
+    fn start_over(&mut self) {
+        self.transcript.clear();
+        self.question.clear();
+        self.asked.clear();
+        self.answer.clear();
+        self.answer_scroll = 0;
+        self.follow = true;
+        self.answer_state = Answer::Idle;
     }
 
     /// Byte offset of the `n`th character, for editing the input.
@@ -645,11 +713,116 @@ mod tests {
             a.handle(Action::Insert(c));
         }
         let task = a.handle(Action::Submit);
-        assert_eq!(task, Some(Task::Ask("why is it slow".into())));
+        assert_eq!(
+            task,
+            Some(Task::Ask {
+                question: "why is it slow".into(),
+                past: Vec::new(),
+            })
+        );
         assert!(a.input.is_empty());
         assert_eq!(a.cursor, 0);
         assert_eq!(a.answer_state, Answer::Working);
         assert_eq!(a.question, "why is it slow");
+    }
+
+    /// Type a question, let it be answered, and end up where the person would.
+    fn answered(a: &mut App, question: &str, answer: &str) -> Option<Task> {
+        a.handle(Action::OpenAsk);
+        for c in question.chars() {
+            a.handle(Action::Insert(c));
+        }
+        let task = a.handle(Action::Submit);
+        a.handle_event(Event::AnswerToken(answer.into()));
+        a.handle_event(Event::AnswerFinished);
+        task
+    }
+
+    #[test]
+    fn an_answered_question_becomes_a_turn_of_the_conversation() {
+        let mut a = sample();
+        answered(&mut a, "why is it slow", "swap is thrashing");
+        assert_eq!(a.transcript.len(), 1);
+        assert_eq!(a.transcript[0].question, "why is it slow");
+        assert_eq!(a.transcript[0].answer, "swap is thrashing");
+        // The turn lives in the transcript now, not in the live slot, so the
+        // pane does not show it twice.
+        assert!(a.question.is_empty());
+        assert!(a.answer.is_empty());
+    }
+
+    #[test]
+    fn a_follow_up_is_sent_with_what_came_before_it() {
+        let mut a = sample();
+        answered(&mut a, "why is it slow", "swap is thrashing");
+        let task = answered(&mut a, "how do I stop that", "add memory");
+        let Some(Task::Ask { question, past }) = task else {
+            panic!("a follow-up must still be a question");
+        };
+        assert_eq!(question, "how do I stop that");
+        assert_eq!(past.len(), 1, "the model has to be told what it said");
+        assert_eq!(past[0].answer, "swap is thrashing");
+        assert_eq!(a.transcript.len(), 2);
+    }
+
+    #[test]
+    fn an_answer_nobody_waited_for_is_not_remembered() {
+        let mut a = sample();
+        a.handle(Action::OpenAsk);
+        for c in "why is it slow".chars() {
+            a.handle(Action::Insert(c));
+        }
+        a.handle(Action::Submit);
+        // Escape stops the stream before anything arrives.
+        a.handle(Action::Back);
+        a.handle_event(Event::AnswerToken("half an ans".into()));
+        a.handle_event(Event::AnswerFinished);
+        assert!(
+            a.transcript.is_empty(),
+            "a stopped answer must not be quoted back to the model later"
+        );
+    }
+
+    #[test]
+    fn a_failed_answer_is_not_remembered() {
+        let mut a = sample();
+        a.handle(Action::OpenAsk);
+        for c in "why".chars() {
+            a.handle(Action::Insert(c));
+        }
+        a.handle(Action::Submit);
+        a.handle_event(Event::AnswerFailed("the model went away".into()));
+        assert!(a.transcript.is_empty());
+    }
+
+    #[test]
+    fn starting_over_forgets_the_conversation() {
+        let mut a = sample();
+        answered(&mut a, "why is it slow", "swap is thrashing");
+        a.handle(Action::NewConversation);
+        assert!(a.transcript.is_empty());
+        assert_eq!(a.answer_state, Answer::Idle);
+        // And the next question is asked with nothing behind it.
+        let task = answered(&mut a, "something else entirely", "fine");
+        assert!(matches!(task, Some(Task::Ask { past, .. }) if past.is_empty()));
+    }
+
+    #[test]
+    fn a_finding_starts_its_own_conversation_and_keeps_its_evidence() {
+        let mut a = sample();
+        answered(&mut a, "why is it slow", "swap is thrashing");
+        a.handle(Action::Back);
+        a.handle(Action::Explain);
+        assert!(
+            a.transcript.is_empty(),
+            "a finding is a new subject, not a follow-up to the last one"
+        );
+        a.handle_event(Event::AnswerToken("it means this".into()));
+        a.handle_event(Event::AnswerFinished);
+        assert_eq!(a.transcript.len(), 1);
+        // The screen shows the title; the model was given the evidence, and
+        // that is what a later turn has to replay.
+        assert!(a.transcript[0].question.contains("Severity"));
     }
 
     #[test]

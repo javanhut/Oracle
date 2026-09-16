@@ -236,6 +236,24 @@ pub fn areas_for_question(question: &str) -> Vec<Area> {
     out
 }
 
+/// The areas a whole conversation is about.
+///
+/// A follow-up often changes the subject -- the disk question that turns into
+/// a package question two turns later -- and the answer to it still has to
+/// see what the earlier turns established. So the areas accumulate rather
+/// than being recomputed from the newest question alone.
+pub fn areas_for_conversation<'a>(questions: impl IntoIterator<Item = &'a str>) -> Vec<Area> {
+    let mut out: Vec<Area> = Vec::new();
+    for q in questions {
+        for a in areas_for_question(q) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
 fn host_facts() -> HostFacts {
     HostFacts {
         kernel: crate::sys::read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_default(),

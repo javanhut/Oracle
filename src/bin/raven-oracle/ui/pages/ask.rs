@@ -22,7 +22,9 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     let (root, content) = widgets::page(
         "Ask",
         "Ask about this machine in plain language. Oracle reads only the parts of the system \
-         the question is about, and hands them to a model running here.",
+         the question is about, and hands them to a model running here. One answer is rarely \
+         the end of it, so there is a reply box under the answer: each follow-up reads the \
+         machine again before it asks.",
     );
 
     let model_note = gtk::Label::new(None);
@@ -35,6 +37,9 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let entry = gtk::Entry::builder()
         .placeholder_text("What is going wrong?")
+        .tooltip_text(
+            "Asking here starts a new conversation. To continue one, reply under the answer.",
+        )
         .hexpand(true)
         .build();
     row.append(&entry);
