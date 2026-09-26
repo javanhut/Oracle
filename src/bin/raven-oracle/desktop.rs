@@ -44,11 +44,16 @@ pub struct Desktop {
 
 impl Desktop {
     pub fn load() -> Desktop {
-        let path = config_dir().join("desktop.toml");
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default()
+    }
+
+    /// Where Settings keeps the file. Settings replaces it by rename, so a
+    /// watcher follows the directory, not the file.
+    pub fn path() -> PathBuf {
+        config_dir().join("desktop.toml")
     }
 
     /// The accent as `#RRGGBB`, or the default when the file's is not one.

@@ -2,6 +2,10 @@
 //! (`data/raven-glass.css`, kept identical across the repos), plus the classes
 //! only Oracle draws -- the verdict hero, severity colours, command wells.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -97,12 +101,25 @@ label.answer { font-size: 14px; }
 const LIGHT_CSS: &str = concat!(
     include_str!("../../../../data/raven-glass-light.css"),
     ".command, .text-well { background-color: alpha(#000000, 0.05); border-color: alpha(#000000, 0.08); }\n",
-    ".past-turn { border-left-color: alpha(#000000, 0.14); }\n"
+    ".past-turn { border-left-color: alpha(#000000, 0.14); }\n",
+    "button.metric-card:hover { background-color: alpha(#ffffff, 0.95); border-color: alpha(#000000, 0.10); }\n"
 );
+
+thread_local! {
+    /// The accent and light-mode provider, replaced (never stacked) on every
+    /// change to the desktop's appearance.
+    static OVERRIDES: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    /// Kept alive for as long as the app runs; dropping it stops the watch.
+    static DESKTOP_MONITOR: RefCell<Option<gio::FileMonitor>> = const { RefCell::new(None) };
+}
+
+/// How long `desktop.toml` has to stay quiet before it is read again: one
+/// save from Settings arrives as a burst of events.
+const DESKTOP_SETTLE: Duration = Duration::from_millis(150);
 
 /// The shared sheet and Oracle's classes in one provider; the accent and the
 /// light-mode overrides in a second one above it, exactly as the other Raven
-/// apps layer theirs.
+/// apps layer theirs. The second follows `desktop.toml` from here on.
 pub fn load(desktop: &Desktop) {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
@@ -114,7 +131,15 @@ pub fn load(desktop: &Desktop) {
         &base,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    apply(desktop);
+    watch_desktop();
+}
 
+/// Light or dark, the accent, and glass on the open windows.
+fn apply(desktop: &Desktop) {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
     let look = &desktop.appearance;
     adw::StyleManager::default().set_color_scheme(match look.theme_mode {
         ThemeMode::Dark => adw::ColorScheme::ForceDark,
@@ -127,17 +152,78 @@ pub fn load(desktop: &Desktop) {
     if look.theme_mode == ThemeMode::Light {
         css.push_str(LIGHT_CSS);
     }
-    let overrides = gtk::CssProvider::new();
-    overrides.load_from_string(&css);
-    gtk::style_context_add_provider_for_display(
-        &display,
-        &overrides,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-    );
+    OVERRIDES.with(|slot| {
+        if let Some(old) = slot.borrow_mut().take() {
+            gtk::style_context_remove_provider_for_display(&display, &old);
+        }
+        let overrides = gtk::CssProvider::new();
+        overrides.load_from_string(&css);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &overrides,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        *slot.borrow_mut() = Some(overrides);
+    });
+
+    // Glass is the material of a Raven window of its own; dialogs over one
+    // stay opaque.
+    let toplevels = gtk::Window::toplevels();
+    for i in 0..toplevels.n_items() {
+        if let Some(window) = toplevels.item(i).and_downcast::<gtk::Window>() {
+            if window.has_css_class("raven") && window.transient_for().is_none() {
+                set_glass(&window, look.transparency);
+            }
+        }
+    }
+}
+
+/// Follow Settings: re-read `desktop.toml` whenever it changes. The directory
+/// is watched, not the file, because Settings replaces the file by rename and
+/// it may not exist yet.
+fn watch_desktop() {
+    let path = Desktop::path();
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let name = name.to_os_string();
+    let Ok(monitor) = gio::File::for_path(dir)
+        .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+    else {
+        return;
+    };
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    monitor.connect_changed(move |_, file, other, event| {
+        if matches!(
+            event,
+            gio::FileMonitorEvent::AttributeChanged
+                | gio::FileMonitorEvent::PreUnmount
+                | gio::FileMonitorEvent::Unmounted
+        ) {
+            return;
+        }
+        let names_desktop = |f: Option<&gio::File>| {
+            f.and_then(|f| f.basename())
+                .is_some_and(|b| b.as_os_str() == name.as_os_str())
+        };
+        if !names_desktop(Some(file)) && !names_desktop(other) {
+            return;
+        }
+        if let Some(id) = pending.borrow_mut().take() {
+            id.remove();
+        }
+        let fired = pending.clone();
+        let id = glib::timeout_add_local_once(DESKTOP_SETTLE, move || {
+            fired.borrow_mut().take();
+            apply(&Desktop::load());
+        });
+        *pending.borrow_mut() = Some(id);
+    });
+    DESKTOP_MONITOR.with(|m| *m.borrow_mut() = Some(monitor));
 }
 
 /// Alpha only; the blur behind a glass window is the compositor's.
-pub fn set_glass(window: &adw::ApplicationWindow, on: bool) {
+pub fn set_glass(window: &impl IsA<gtk::Widget>, on: bool) {
     if on {
         window.add_css_class("glass");
     } else {
