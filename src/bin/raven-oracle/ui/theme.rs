@@ -135,7 +135,7 @@ pub fn load(desktop: &Desktop) {
     watch_desktop();
 }
 
-/// Light or dark, the accent, and glass on the open windows.
+/// Light or dark, the accent, the glass theme, and glass on the open windows.
 fn apply(desktop: &Desktop) {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
@@ -152,6 +152,10 @@ fn apply(desktop: &Desktop) {
     if look.theme_mode == ThemeMode::Light {
         css.push_str(LIGHT_CSS);
     }
+    css.push_str(&crate::glass_tint::css(
+        &look.glass_theme,
+        look.theme_mode == ThemeMode::Light,
+    ));
     OVERRIDES.with(|slot| {
         if let Some(old) = slot.borrow_mut().take() {
             gtk::style_context_remove_provider_for_display(&display, &old);

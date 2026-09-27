@@ -1,7 +1,7 @@
 //! The slice of `~/.config/raven/desktop.toml` this app follows: theme
-//! mode, accent and window transparency. Settings owns the file; every key
-//! is optional and a parse error means the defaults, so a newer Settings
-//! never breaks an older Oracle.
+//! mode, accent, glass theme and window transparency. Settings owns the
+//! file; every key is optional and a parse error means the defaults, so a
+//! newer Settings never breaks an older Oracle.
 
 use std::path::PathBuf;
 
@@ -24,6 +24,7 @@ pub struct Appearance {
     pub theme_mode: ThemeMode,
     pub accent: String,
     pub transparency: bool,
+    pub glass_theme: String,
 }
 
 impl Default for Appearance {
@@ -32,6 +33,7 @@ impl Default for Appearance {
             theme_mode: ThemeMode::Dark,
             accent: DEFAULT_ACCENT.into(),
             transparency: true,
+            glass_theme: String::new(),
         }
     }
 }

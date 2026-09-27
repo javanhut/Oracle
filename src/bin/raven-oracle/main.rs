@@ -11,6 +11,7 @@
 //! without being opened.
 
 mod desktop;
+mod glass_tint;
 mod ui;
 
 const HELP: &str = "\
