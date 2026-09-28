@@ -1141,6 +1141,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "ratatui",
+ "raven-glass",
  "rustls",
  "rustls-native-certs",
  "serde",
@@ -1509,6 +1510,10 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
 ]
+
+[[package]]
+name = "raven-glass"
+version = "0.0.1"
 
 [[package]]
 name = "redox_syscall"

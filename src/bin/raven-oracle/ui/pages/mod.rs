@@ -22,7 +22,7 @@ pub struct PageInfo {
     /// Settings sits below a separator.
     pub separated: bool,
     /// The colour of the icon tile beside the title in the sidebar; see
-    /// `.nav-icon` in `data/raven-glass.css`. Names a domain, never the
+    /// `.nav-icon` in Raven Glass (the raven-glass crate). Names a domain, never the
     /// accent, so the sidebar stays legible under any accent.
     pub tint: &'static str,
 }

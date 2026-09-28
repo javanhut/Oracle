@@ -1,6 +1,6 @@
-//! The look: Raven Glass, the stylesheet shared with Settings, Store and Power
-//! (`data/raven-glass.css`, kept identical across the repos), plus the classes
-//! only Oracle draws -- the verdict hero, severity colours, command wells.
+//! The look: Raven Glass, the stylesheet every Raven app shares (the
+//! raven-glass crate in RavenGUI, read from /usr/share/raven/glass/), plus the
+//! classes only Oracle draws -- the verdict hero, severity colours, command wells.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,9 +12,8 @@ use libadwaita::prelude::*;
 
 use crate::desktop::{Desktop, ThemeMode};
 
-pub const BASE_CSS: &str = concat!(
-    include_str!("../../../../data/raven-glass.css"),
-    r#"
+/// Laid over Raven Glass.
+pub const ORACLE_CSS: &str = r#"
 /* ── Raven Oracle ────────────────────────────────────────────────────── */
 
 /* The rule above Settings is a line, not a disabled row. */
@@ -95,11 +94,10 @@ label.answer { font-size: 14px; }
 
 .promise image { color: @success_color; }
 .promise image.warning { color: @warning_color; }
-"#
-);
+"#;
 
-const LIGHT_CSS: &str = concat!(
-    include_str!("../../../../data/raven-glass-light.css"),
+/// Laid over Raven Glass, light, when the desktop is light.
+const ORACLE_LIGHT_CSS: &str = concat!(
     ".command, .text-well { background-color: alpha(#000000, 0.05); border-color: alpha(#000000, 0.08); }\n",
     ".past-turn { border-left-color: alpha(#000000, 0.14); }\n",
     "button.metric-card:hover { background-color: alpha(#ffffff, 0.95); border-color: alpha(#000000, 0.10); }\n"
@@ -125,7 +123,7 @@ pub fn load(desktop: &Desktop) {
         return;
     };
     let base = gtk::CssProvider::new();
-    base.load_from_string(BASE_CSS);
+    base.load_from_string(&format!("{}{ORACLE_CSS}", raven_glass::base_css()));
     gtk::style_context_add_provider_for_display(
         &display,
         &base,
@@ -150,9 +148,10 @@ fn apply(desktop: &Desktop) {
     let mut css =
         format!("@define-color accent_bg_color {accent};\n@define-color accent_color {accent};\n");
     if look.theme_mode == ThemeMode::Light {
-        css.push_str(LIGHT_CSS);
+        css.push_str(raven_glass::light_css());
+        css.push_str(ORACLE_LIGHT_CSS);
     }
-    css.push_str(&crate::glass_tint::css(
+    css.push_str(&raven_glass::tint::css(
         &look.glass_theme,
         look.theme_mode == ThemeMode::Light,
     ));
